@@ -3,8 +3,12 @@
   "private": true,
   "version": "0.0.0",
   "engines": {
-    "node": "^22.12.0 || >=24.0.0"
+    "node": "^22.12.0"
   },
+  "allowedScripts": [
+    "argon2@0.45.1",
+    "mongodb-memory-server@11.3.0"
+  ],
   "type": "module",
   "scripts": {
     "dev": "concurrently --kill-others --names api,web \"npm:dev:api\" \"npm:dev:web\"",
