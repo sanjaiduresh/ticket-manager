@@ -1,0 +1,25 @@
+.report-definitions { padding: 20px 24px; margin-bottom: 20px; border-left: 3px solid #087d70; }
+.report-definitions h2 { font-size: 15px; font-weight: 650; margin-bottom: 8px; }
+.report-definitions p { font-size: 13px; line-height: 1.7; color: #52605b; margin: 8px 0; }
+.report-filters { display: flex; align-items: end; flex-wrap: wrap; gap: 14px; padding: 18px 20px; margin-bottom: 20px; }
+.report-filters label { display: grid; gap: 7px; font-size: 12px; font-weight: 550; flex: 1 1 150px; min-width: 0; }
+.report-filters input, .report-filters select { width: 100%; min-width: 0; }
+.report-filters .filter-context, .report-filters .form-error { flex-basis: 100%; font-size: 12px; }
+.report-filters .filter-context { color: #52605b; }
+.report-toolbar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 14px; margin: 18px 0; font-size: 13px; color: #52605b; }
+.report-toolbar .actions { flex-wrap: wrap; }
+.report-counts .metric { min-width: 0; }
+.report-counts .metric > span { display: flex; align-items: center; gap: 8px; line-height: 1.5; }
+.report-counts .metric > span svg { flex-shrink: 0; color: #087d70; }
+.report-counts .metric small { color: #68756f; font-size: 11px; }
+.report-chart-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; margin: 20px 0; }
+.report-chart { min-width: 0; overflow: hidden; }
+.report-chart .section-heading { padding: 20px 20px 10px; }
+.chart-frame { height: 320px; min-height: 320px; width: 100%; min-width: 0; }
+.report-data { padding: 14px 20px; }
+.report-data summary { cursor: pointer; color: #087d70; font-size: 12px; padding: 6px 0; }
+.report-data summary:focus-visible { outline: 2px solid #087d70; outline-offset: 3px; }
+.report-empty { padding: 20px; font-size: 13px; color: #68756f; }
+.report-chart table th[scope="row"] { font-weight: 500; text-transform: none; letter-spacing: normal; }
+@media (max-width: 1100px) { .report-chart-grid { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 600px) { .report-definitions { padding: 16px; } .report-filters { padding: 16px; } .report-filters label { flex-basis: 100%; } .report-toolbar { align-items: flex-start; } .report-chart .section-heading { padding: 16px; } }
