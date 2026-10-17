@@ -20,14 +20,26 @@ export default async function handler(req, res) {
       return
     }
 
-    const origins = (process.env.APP_ORIGINS || '')
+    const explicitOrigins = (process.env.APP_ORIGINS || '')
       .split(',')
       .map(s => s.trim())
       .filter(Boolean)
 
-    if (!origins.length) {
-      res.status(500).json({ error: 'APP_ORIGINS environment variable is not set.' })
-      return
+    // Allow explicitly configured origins as well as all Vercel deployment preview/production URLs
+    const origins = {
+      includes(origin) {
+        if (!origin || typeof origin !== 'string') return false
+        if (explicitOrigins.includes(origin)) return true
+        try {
+          const u = new URL(origin)
+          if (u.protocol === 'https:' && (u.hostname.endsWith('.vercel.app') || explicitOrigins.includes(u.origin))) {
+            return true
+          }
+        } catch {
+          return false
+        }
+        return false
+      },
     }
 
     cachedClient = new MongoClient(process.env.MONGODB_URI, {
