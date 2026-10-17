@@ -20,7 +20,23 @@ export function PageHeader({ title, subtitle, children }: { title: string; subti
   return <header className="page-heading"><div><h1>{title}</h1><p>{subtitle}</p></div><div className="actions">{children}</div></header>
 }
 export function Modal({ title, description, children, onClose, wide = false }: { title: string; description: string; children: ReactNode; onClose(): void; wide?: boolean }) {
-  return <Dialog open onOpenChange={open => { if (!open) onClose() }}><DialogContent className={wide ? 'desk-dialog detail-dialog' : 'desk-dialog'}><DialogHeader><DialogTitle>{title}</DialogTitle><DialogDescription>{description}</DialogDescription></DialogHeader>{children}</DialogContent></Dialog>
+  return (
+    <Dialog open onOpenChange={open => { if (!open) onClose() }}>
+      <DialogContent
+        className={
+          wide
+            ? 'desk-dialog detail-dialog !top-0 !right-0 !left-auto !bottom-0 !translate-x-0 !translate-y-0 !h-[100dvh] !max-h-[100dvh] !overflow-y-auto !rounded-none !block'
+            : 'desk-dialog !max-h-[calc(100dvh-40px)] !overflow-y-auto'
+        }
+      >
+        <DialogHeader>
+          <DialogTitle>{title}</DialogTitle>
+          <DialogDescription>{description}</DialogDescription>
+        </DialogHeader>
+        {children}
+      </DialogContent>
+    </Dialog>
+  )
 }
 export function StatusBadge({ value }: { value: string }) { return <span className={`status status-${value}`}><span className="status-dot" aria-hidden="true"/>{label(value)}</span> }
 export function PriorityBadge({ value }: { value: string }) {
