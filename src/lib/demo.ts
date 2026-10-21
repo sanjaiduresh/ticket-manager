@@ -1,6 +1,7 @@
-import type { DataApi, Dataset, Profile, Ticket, TicketEvent } from './types'
-import { computeDemoPerformance } from './reporting'
+import type { DataApi, Dataset, Profile, Ticket, TicketEvent, AttendanceRecord, AssignmentNotification } from './types'
+import { computeDemoPerformance, istDate, rangeError } from './reporting'
 import { assigneeIds, sameAssignees } from './assignees'
+import { whatsappNumberError } from './whatsapp'
 
 const company_id = 'demo-company'
 export const demoOwner: Profile = { company_id, id: 'demo-owner', full_name: 'Ananya Rao', role: 'owner', active: true, must_change_password: false }
@@ -42,6 +43,16 @@ export function createDemoApi(actorId = demoOwner.id): DataApi {
     })),
   }
   const events: TicketEvent[] = dataset.tickets.map(ticket => ({ company_id, id: crypto.randomUUID(), ticket_id: ticket.id, actor_id: demoOwner.id, body: JSON.stringify({ action: 'created' }), created_at: ticket.created_at }))
+  const attendance: AttendanceRecord[] = []
+  const deletedTickets = new Map<string, { version: number; confirmation: string; reason: string }>()
+  let ticketSequence = Math.max(0, ...dataset.tickets.map(ticket => ticket.number))
+  const notifications: AssignmentNotification[] = []
+  function notify(ticket: Ticket, previous: Ticket['assigned_to'], kind: AssignmentNotification['kind']) {
+    for (const recipient_id of assigneeIds(ticket.assigned_to).filter(id => !assigneeIds(previous).includes(id))) {
+      notifications.push({ id: crypto.randomUUID(), company_id, recipient_id, ticket_id: ticket.id, ticket_number: ticket.number, kind, created_at: new Date().toISOString(), read_at: null })
+    }
+  }
+  dataset.tickets.forEach(ticket => notify(ticket, [], 'created'))
   const clone = <T,>(v: T): T => structuredClone(v)
   function actor() {
     const profile = dataset.profiles.find(p => p.id === actorId && p.company_id === company_id)
@@ -65,14 +76,63 @@ export function createDemoApi(actorId = demoOwner.id): DataApi {
     if (input.outage_id && dataset.outages.find(o => o.id === input.outage_id)?.provider_id !== dataset.connections.find(c => c.id === input.connection_id)?.provider_id) throw new Error('Outage must match the connection provider')
   }
   return {
+    async attendance(range) {
+      const user = actor(); const error = rangeError(range)
+      if (error) throw new Error(error)
+      return clone({ ...range, generated_at: new Date().toISOString(),
+        records: attendance.filter(record => (user.role !== 'technician' || record.employee_id === actorId) && record.day >= range.from && record.day <= range.to).sort((a, b) => b.day.localeCompare(a.day)) })
+    },
+    async saveAttendance(input) {
+      office()
+      const value = clone(input)
+      const error = rangeError({ from: value.day, to: value.day })
+      if (error || value.day > istDate()) throw new Error(error || 'Attendance cannot be recorded for a future day')
+      if (!dataset.profiles.some(p => p.id === value.employee_id)) throw new Error('Employee unavailable')
+      if (!['present', 'absent', 'half_day', 'leave'].includes(value.status) || !Number.isInteger(value.version) || value.version < 0) throw new Error('Invalid attendance status or version')
+      if (typeof value.note !== 'string' || value.note.trim().length > 2000) throw new Error('Notes must be text up to 2000 characters')
+      value.note = value.note.trim()
+      for (const key of ['check_in', 'check_out'] as const) {
+        if (value[key] !== null) {
+          if (!Number.isFinite(Date.parse(value[key]!))) throw new Error('Invalid attendance time')
+          value[key] = new Date(value[key]!).toISOString()
+          if (Date.parse(value[key]) > Date.now()) throw new Error('Attendance times cannot be in the future')
+        }
+      }
+      if (['absent', 'leave'].includes(value.status) && (value.check_in || value.check_out)) throw new Error('Absent and leave records cannot have attendance times')
+      if (value.check_in && istDate(value.check_in) !== value.day) throw new Error('Check-in must fall on the attendance day in IST')
+      if (value.check_out && (!value.check_in || value.check_out < value.check_in)) throw new Error('Check-out requires a check-in and cannot be earlier')
+      const prior = attendance.find(record => record.id === value.id)
+      if (prior) {
+        if (prior.employee_id !== value.employee_id || prior.day !== value.day) throw new Error('Employee and attendance day cannot be changed')
+        const unchanged = Object.entries(value).filter(([key]) => key !== 'version').every(([key, field]) => prior[key as keyof AttendanceRecord] === field)
+        if (unchanged && prior.updated_by === actorId && prior.version === value.version + 1) return
+        if (prior.version !== value.version) throw new Error('Attendance changed. Reload the record before saving')
+        if (unchanged) return
+      } else {
+        if (value.version !== 0) throw new Error('Attendance record unavailable')
+        if (attendance.some(record => record.employee_id === value.employee_id && record.day === value.day)) throw new Error('Attendance already exists for this employee and day. Edit the existing record')
+      }
+      const next = { ...value, company_id, version: value.version + 1, recorded_by: prior?.recorded_by ?? actorId, updated_by: actorId, updated_at: new Date().toISOString() }
+      if (prior) Object.assign(prior, next)
+      else attendance.push(next)
+    },
+    async notifications() {
+      actor(); const items = notifications.filter(item => item.recipient_id === actorId)
+      return clone({ items: items.slice().reverse().slice(0, 100), unread_count: items.filter(item => !item.read_at).length })
+    },
+    async readNotifications(id) {
+      actor()
+      if (id && !notifications.some(item => item.id === id && item.recipient_id === actorId)) throw new Error('Notification unavailable')
+      notifications.filter(item => item.recipient_id === actorId && (!id || item.id === id)).forEach(item => { item.read_at ??= new Date().toISOString() })
+    },
     async performance(range) { if (actor().role !== 'owner') throw new Error('Owner access required'); return computeDemoPerformance(dataset, events, range) },
     async load() {
       if (actor().role !== 'technician') return clone(dataset)
       const tickets = dataset.tickets.filter(accessible)
       const connections = dataset.connections.filter(c => tickets.some(t => t.connection_id === c.id))
-      return clone({ ...dataset, tickets, connections, customers: dataset.customers.filter(c => connections.some(connection => connection.customer_id === c.id)), outages: dataset.outages.filter(o => tickets.some(t => t.outage_id === o.id)) })
+      return clone({ ...dataset, profiles: dataset.profiles.map(({ whatsapp_number: _phone, ...profile }) => profile), tickets, connections, customers: dataset.customers.filter(c => connections.some(connection => connection.customer_id === c.id)), outages: dataset.outages.filter(o => tickets.some(t => t.outage_id === o.id)) })
     },
-    async profile(id) { const p = dataset.profiles.find(p => p.id === id); if (!p) throw new Error('Profile unavailable'); return clone(p) },
+    async profile(id) { const p = dataset.profiles.find(p => p.id === id); if (!p) throw new Error('Profile unavailable'); const { whatsapp_number: _phone, ...publicProfile } = p; return clone(publicProfile) },
     async events(id) { if (!dataset.tickets.some(t => t.id === id && accessible(t))) throw new Error('Ticket unavailable'); return clone(events.filter(e => e.ticket_id === id)) },
     async createCustomer(input) {
       office()
@@ -85,12 +145,14 @@ export function createDemoApi(actorId = demoOwner.id): DataApi {
     },
     async createTicket(input) {
       office()
+      if (deletedTickets.has(input.id)) throw new Error('This ticket was permanently deleted. Create a new ticket instead')
       const assigned_to = normalized(input.assigned_to)
       checkReferences({ ...input, assigned_to })
       if (dataset.tickets.some(t => t.id === input.id)) return
-      dataset.tickets.push({ ...clone(input), assigned_to, connection_id: input.connection_id ?? null, company_id, number: Math.max(...dataset.tickets.map(t => t.number)) + 1, status: assigned_to.length ? 'assigned' : 'new',
+      dataset.tickets.push({ ...clone(input), assigned_to, connection_id: input.connection_id ?? null, company_id, number: ++ticketSequence, status: assigned_to.length ? 'assigned' : 'new',
         provider_reference: '', visit_at: null, follow_up_at: null, resolution: '', customer_feedback: '', created_at: time(0), updated_at: time(0), version: 1 })
       events.push({ company_id, id: crypto.randomUUID(), ticket_id: input.id, actor_id: actorId, body: JSON.stringify({ action: 'created' }), created_at: time(0) })
+      notify(dataset.tickets.at(-1)!, [], 'created')
     },
     async updateTicket(id, version, patch, note) {
       const ticket = dataset.tickets.find(t => t.id === id)
@@ -125,21 +187,43 @@ export function createDemoApi(actorId = demoOwner.id): DataApi {
       if (next.status === 'assigned' && !next.assigned_to.length) next.status = 'new'
       if (next.status === 'in_progress' && !next.assigned_to.length) throw new Error('Assign a technician before starting work.')
       const changes = Object.fromEntries(Object.entries(next).filter(([key, value]) => key === 'assigned_to' ? !sameAssignees(next.assigned_to, ticket.assigned_to) : value !== ticket[key as keyof typeof ticket]).map(([key, value]) => [key, { from: ticket[key as keyof typeof ticket], to: value }]))
+      notify(next, ticket.assigned_to, 'assigned')
       Object.assign(ticket, next, { version: version + 1, updated_at: time(0) })
       events.push({ company_id, id: crypto.randomUUID(), ticket_id: id, actor_id: actorId, body: JSON.stringify({ action: 'updated', changes }), created_at: time(0) })
       if (note.trim()) events.push({ company_id, id: crypto.randomUUID(), ticket_id: id, actor_id: actorId, body: JSON.stringify({ action: 'note', text: note.trim() }), created_at: time(0) })
+    },
+    async deleteTicket(id, version, confirmation, reason) {
+      office()
+      reason = reason.trim()
+      if (!reason || reason.length > 500) throw new Error('Provide a deletion reason up to 500 characters')
+      const prior = deletedTickets.get(id)
+      if (prior) {
+        if (prior.version !== version || prior.confirmation !== confirmation || prior.reason !== reason) throw new Error('Ticket already deleted; the deletion request does not match')
+        return
+      }
+      const index = dataset.tickets.findIndex(ticket => ticket.id === id)
+      if (index < 0) throw new Error('Ticket unavailable')
+      const ticket = dataset.tickets[index]
+      if (ticket.version !== version) throw new Error('Ticket changed. Reload before deleting')
+      if (confirmation !== `DSA-${ticket.number}`) throw new Error('Type the exact ticket reference to confirm deletion')
+      deletedTickets.set(id, { version, confirmation, reason })
+      dataset.tickets.splice(index, 1)
+      for (let i = events.length - 1; i >= 0; i--) if (events[i].ticket_id === id) events.splice(i, 1)
+      for (let i = notifications.length - 1; i >= 0; i--) if (notifications[i].ticket_id === id) notifications.splice(i, 1)
     },
     async createOutage(input) { office(); dataset.outages.push({ ...input, company_id, id: crypto.randomUUID(), status: 'active', created_at: time(0), restored_at: null }) },
     async restoreOutage(id) { office(); const outage = dataset.outages.find(o => o.id === id); if (outage) Object.assign(outage, { status: 'restored', restored_at: time(0) }) },
     async staff(input) {
       if (input.action !== 'change_password' && actor().role !== 'owner') throw new Error('Owner access required')
-      if (input.action === 'create') dataset.profiles.push({ company_id, id: crypto.randomUUID(), full_name: input.full_name, role: input.role, active: true, must_change_password: true })
+      if ('whatsapp_number' in input && input.whatsapp_number !== undefined && whatsappNumberError(input.whatsapp_number)) throw new Error(whatsappNumberError(input.whatsapp_number))
+      if (input.action === 'create') dataset.profiles.push({ company_id, id: crypto.randomUUID(), full_name: input.full_name, role: input.role, whatsapp_number: input.whatsapp_number?.trim() ?? '', active: true, must_change_password: true })
       else if (input.action === 'change_password') return // Simulation only; never retain demo passwords.
       else {
         const profile = dataset.profiles.find(p => p.id === input.id)
         if (!profile) throw new Error('Staff member unavailable')
         if (profile.role === 'owner') throw new Error('Owner changes are not supported here.')
-        if (input.action === 'reset_password') profile.must_change_password = true
+        if (input.action === 'set_whatsapp') profile.whatsapp_number = input.whatsapp_number.trim()
+        else if (input.action === 'reset_password') profile.must_change_password = true
         else { if (input.role) profile.role = input.role; if (input.active !== undefined) profile.active = input.active }
       }
     },

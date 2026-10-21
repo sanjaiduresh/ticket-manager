@@ -132,6 +132,7 @@ async function mockLive(page: Page, options: { profile?: unknown; profileStatus?
     if (path === '/api/auth/logout') return reply(route, options.logoutStatus ?? 200, options.logoutStatus ? { error: 'Logout failed' } : { ok: true })
     if (path === '/api/profile') return reply(route, options.profileStatus ?? 200, options.profileStatus ? { error: 'Staff access unavailable' } : options.profile === undefined ? profile : options.profile)
     if (path === '/api/workspace') return reply(route, 200, data)
+    if (path === '/api/notifications') return reply(route, 200, { items: [], unread_count: 0 })
     if (path.endsWith('/events')) return reply(route, 200, [])
     if (options.extra) return options.extra(route, path)
     if (path.endsWith('/images')) return reply(route, 200, [])
@@ -217,6 +218,7 @@ test('company A logout then B login never renders A data, events or images', asy
     if (path === '/api/auth/logout') return reply(route, 200, { ok: true })
     if (path === '/api/profile') return reply(route, 200, actors[actor])
     if (path === '/api/workspace') { if (actor) { bLoads++; await gate } return reply(route, 200, datasets[actor]) }
+    if (path === '/api/notifications') return reply(route, 200, { items: [], unread_count: 0 })
     if (path.endsWith('/events')) return reply(route, 200, [{ id: 'event', ticket_id: path.split('/')[3], company_id: actors[actor].company_id, actor_id: actors[actor].id, body: `${actor ? 'B' : 'A'} Private Activity`, created_at: '2026-10-16T00:00:00Z' }])
     if (path.endsWith('/images')) return reply(route, 200, [])
     throw new Error(path)

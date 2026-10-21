@@ -3,13 +3,15 @@ import cookieParser from 'cookie-parser'
 import helmet from 'helmet'
 import { randomUUID } from 'node:crypto'
 import { resolve } from 'node:path'
-import { ZodError } from 'zod'
+import { z, ZodError } from 'zod'
 import { registerSchema, loginSchema, customerSchema, ticketSchema, updateSchema, outageSchema, staffSchema, uuid, demand, HttpError, ticketTransition } from './schema.js'
 import { transaction, companyWrite, publicProfile, profileFields, providers, now, office, ticketFilter, findTicket, references, event, audit } from './database.js'
 import { authenticate, hashPassword, verifyPassword, makeSession, setSessionCookie, cookieName, cookieOptions, limit } from './security.js'
-import { installImages } from './images.js'
+import { cleanupImages, installImages } from './images.js'
 import { installPerformance } from './performance.js'
 import { assignmentIds, sameAssignments } from './assignments.js'
+import { installAttendance } from './attendance.js'
+import { installNotifications, notifyAssignments } from './notifications.js'
 
 export async function createApp({ db, client, media, origins, production = false, trustProxy = false, staticDir, rateLimits = true }) {
   const app = express()
@@ -96,7 +98,8 @@ export async function createApp({ db, client, media, origins, production = false
       const connections = await db.collection('connections').find({ ...scope, ...(user.role === 'technician' ? { id: { $in: tickets.map(t => t.connection_id).filter(id => typeof id === 'string') } } : {}) }, options).toArray()
       const customers = await db.collection('customers').find({ ...scope, ...(user.role === 'technician' ? { id: { $in: connections.map(c => c.customer_id) } } : {}) }, options).toArray()
       const companies = await db.collection('companies').find({ id: user.company_id }, { session, projection: { _id: 0, id: 1, name: 1, created_at: 1 } }).toArray()
-      const profiles = await db.collection('users').find(scope, { session, projection: profileFields }).toArray()
+      // Employee contact numbers are operational data for owner/office only.
+      const profiles = await db.collection('users').find(scope, { session, projection: { ...profileFields, ...(user.role !== 'technician' ? { whatsapp_number: 1 } : {}) } }).toArray()
       const outages = await db.collection('outages').find(scope, options).toArray()
       return { companies, profiles, tickets, customers, connections, outages, providers }
     })
@@ -125,10 +128,12 @@ export async function createApp({ db, client, media, origins, production = false
       office(user)
       // UUID retries acknowledge only a ticket already in this caller's company.
       if (await db.collection('tickets').findOne({ id: input.id, company_id: user.company_id }, options)) return
+      demand(!await db.collection('ticket_deletions').findOne({ id: input.id }, options), 409, 'Ticket ID unavailable. Create a new ticket instead')
       await references(db, user, input, options)
       const company = await db.collection('companies').findOneAndUpdate({ id: user.company_id }, { $inc: { ticket_sequence: 1 } }, { ...options, returnDocument: 'after' })
       await db.collection('tickets').insertOne({ ...input, company_id: user.company_id, number: company.ticket_sequence, status: input.assigned_to.length ? 'assigned' : 'new', provider_reference: '', visit_at: null, follow_up_at: null, resolution: '', customer_feedback: '', created_at: now(), updated_at: now(), version: 1 }, options)
       await event(db, user, input.id, { action: 'created' }, options)
+      await notifyAssignments(db, user, { ...input, number: company.ticket_sequence }, [], 'created', options)
     })
     res.status(201).json({ ok: true })
   })
@@ -147,7 +152,37 @@ export async function createApp({ db, client, media, origins, production = false
       await db.collection('tickets').updateOne({ id, company_id: user.company_id, version }, { $set: { ...document, version: version + 1, updated_at: now() } }, options)
       if (Object.keys(changes).length) await event(db, user, id, { action: 'updated', changes }, options)
       if (note) await event(db, user, id, { action: 'note', text: note }, options)
+      if (assignmentChanged) await notifyAssignments(db, user, next, ticket.assigned_to, 'assigned', options)
     })
+    res.json({ ok: true })
+  })
+  app.delete('/api/tickets/:id', async (req, res) => {
+    office(req.auth.user)
+    const id = uuid.parse(req.params.id)
+    const input = z.strictObject({ version: z.number().int().positive(), confirmation: z.string().max(80), reason: z.string().trim().min(1).max(500) }).parse(req.body)
+    const company_id = await companyWrite(client, db, req.auth, async (user, options) => {
+      office(user)
+      const scope = { company_id: user.company_id }
+      const prior = await db.collection('ticket_deletions').findOne({ ...scope, id }, options)
+      if (prior) {
+        demand(prior.version === input.version && prior.confirmation === input.confirmation && prior.reason === input.reason && prior.actor_id === user.id, 409, 'Ticket already deleted; the deletion request does not match')
+        return user.company_id
+      }
+      const ticket = await findTicket(db, user, id, options)
+      demand(ticket.version === input.version, 409, 'Ticket changed. Reload before deleting')
+      demand(input.confirmation === `DSA-${ticket.number}`, 400, 'Type the exact ticket reference to confirm deletion')
+      await db.collection('ticket_deletions').insertOne({ id, ...scope, number: ticket.number, ...input, actor_id: user.id, created_at: now() }, options)
+      await db.collection('events').deleteMany({ ...scope, ticket_id: id }, options)
+      await db.collection('notifications').deleteMany({ ...scope, ticket_id: id }, options)
+      // Keep in-flight reservations until the upload timeout: destroying them now
+      // could race an upload that recreates the remote asset after destruction.
+      await db.collection('images').updateMany({ ...scope, ticket_id: id, state: 'ready' }, { $set: { state: 'deleting' } }, options)
+      await db.collection('tickets').deleteOne({ ...scope, id, version: input.version }, options)
+      await audit(db, user, 'ticket_deleted', id, options)
+      return user.company_id
+    })
+    // Remote failures must not reverse or misreport a committed deletion.
+    try { await cleanupImages(db, media, { company_id, ticket_id: id }) } catch { /* The durable cleanup queue is retried by maintenance. */ }
     res.json({ ok: true })
   })
   app.post('/api/outages', async (req, res) => {
@@ -181,13 +216,19 @@ export async function createApp({ db, client, media, origins, production = false
       demand(user.role === 'owner', 403, 'Owner access required')
       if (input.action === 'create') {
         const id = randomUUID()
-        await db.collection('users').insertOne({ id, company_id: user.company_id, full_name: input.full_name, email: input.email, password_hash, role: input.role, active: true, must_change_password: true, auth_version: 1, email_verified: false, created_at: now() }, options)
+        await db.collection('users').insertOne({ id, company_id: user.company_id, full_name: input.full_name, email: input.email, password_hash, role: input.role, whatsapp_number: input.whatsapp_number ?? '', active: true, must_change_password: true, auth_version: 1, email_verified: false, created_at: now() }, options)
         await audit(db, user, 'staff_created', id, options)
         return
       }
       const target = await db.collection('users').findOne({ id: input.id, company_id: user.company_id }, options)
       demand(target, 404, 'Staff member unavailable')
       demand(target.role !== 'owner', 403, 'Owner accounts cannot be changed through team administration')
+      if (input.action === 'set_whatsapp') {
+        await db.collection('users').updateOne({ id: target.id, company_id: user.company_id }, { $set: { whatsapp_number: input.whatsapp_number } }, options)
+        // Contact changes do not change access or revoke the employee's sessions.
+        await audit(db, user, 'whatsapp_contact_updated', target.id, options)
+        return
+      }
       const fields = input.action === 'reset_password' ? { password_hash, must_change_password: true } : { ...(input.role ? { role: input.role } : {}), ...(input.active !== undefined ? { active: input.active } : {}) }
       demand(Object.keys(fields).length, 400, 'Provide a staff change')
       await db.collection('users').updateOne({ id: target.id, company_id: user.company_id }, { $set: fields, $inc: { auth_version: 1 } }, options)
@@ -196,6 +237,8 @@ export async function createApp({ db, client, media, origins, production = false
     res.json({ ok: true })
   })
   installPerformance(app, { db, client })
+  installAttendance(app, { db, client })
+  installNotifications(app, { db, client })
   installImages(app, { db, client, media, throttle })
   app.use('/api', (_req, res) => res.status(404).json({ error: 'Endpoint not found' }))
   if (staticDir) {

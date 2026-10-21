@@ -3,12 +3,13 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { BrowserRouter, NavLink, Navigate, Route, Routes, useLocation } from 'react-router-dom'
 import { clearLegacyAuth, hasSavedSession, saveSessionHint, sessionHintKey, type Session } from './lib/session'
 import { apiRequest, ApiError } from './lib/http'
-import { Building2, Ticket, Users, Radio, ChartNoAxesCombined, UserRoundCog, LogOut, ChevronRight, Menu, RefreshCw, KeyRound, X } from 'lucide-react'
+import { Building2, Ticket, Users, Radio, ChartNoAxesCombined, UserRoundCog, LogOut, ChevronRight, Menu, RefreshCw, KeyRound, X, Clock3 } from 'lucide-react'
 import { toast } from 'sonner'
 import { Button } from './components/ui/button'
 import { ErrorNotice, Loading } from './components/shared'
 import { Login, PasswordDialog, PasswordForm } from './features/auth'
 import { TicketsPage } from './features/tickets'
+import { Notifications } from './features/notifications'
 import { CompanyWorkspaceError, liveApi } from './lib/data'
 import { deskQueryOptions, discardOtherWorkspaces, profileKey, workspaceScope } from './lib/queries'
 import { createDemoApi, demoOwner } from './lib/demo'
@@ -22,6 +23,7 @@ const OutagesPage = lazy(() => import('./features/outages').then(m => ({ default
 const TeamPage = lazy(() => import('./features/team').then(m => ({ default: m.TeamPage })))
 const ReportsPage = lazy(() => import('./features/reports').then(m => ({ default: m.ReportsPage })))
 const PerformancePage = lazy(() => import('./features/performance').then(m => ({ default: m.PerformancePage })))
+const AttendancePage = lazy(() => import('./features/attendance').then(m => ({ default: m.AttendancePage })))
 
 type Mode = { kind: 'login'; error?: Error } | { kind: 'live'; session: Session | null } | { kind: 'demo'; api: DataApi }
 export default function App() {
@@ -93,7 +95,7 @@ function Shell() {
   const company = data.companies.find(company => company.id === profile.company_id)!
   const [password, setPassword] = useState(false); const [menu, setMenu] = useState(false)
   const office = profile.role !== 'technician'
-  const navigation = [ { path: '/tickets', text: office ? 'Tickets' : 'My jobs', icon: Ticket }, ...(office ? [{ path: '/customers', text: 'Customers', icon: Users }] : []), { path: '/outages', text: 'Outages', icon: Radio }, ...(office ? [{ path: '/reports', text: 'Reports', icon: ChartNoAxesCombined }] : []), ...(profile.role === 'owner' ? [{ path: '/performance', text: 'Performance', icon: ChartNoAxesCombined }, { path: '/team', text: 'Team', icon: UserRoundCog }] : []) ]
+  const navigation = [ { path: '/tickets', text: office ? 'Tickets' : 'My jobs', icon: Ticket }, { path: '/attendance', text: 'Attendance', icon: Clock3 }, ...(office ? [{ path: '/customers', text: 'Customers', icon: Users }] : []), { path: '/outages', text: 'Outages', icon: Radio }, ...(office ? [{ path: '/reports', text: 'Reports', icon: ChartNoAxesCombined }] : []), ...(profile.role === 'owner' ? [{ path: '/performance', text: 'Performance', icon: ChartNoAxesCombined }, { path: '/team', text: 'Team', icon: UserRoundCog }] : []) ]
   const title = navigation.find(n => n.path === location.pathname)?.text ?? 'Tickets'
   const nav = <>
     <div className="sidebar-brand"><div className="brand-mark"><Building2 size={21} aria-hidden="true"/></div><div><strong>DSA</strong><span>Service Desk</span></div></div>
@@ -113,9 +115,9 @@ function Shell() {
     <div className="workspace-main">
       <header className="topbar">
         <div className="actions"><Button className="mobile-menu-button" variant="ghost" size="icon" aria-label="Open navigation" onClick={() => setMenu(true)}><Menu aria-hidden="true"/></Button><div className="breadcrumb"><span title={company.name}>{company.name}</span><ChevronRight size={13} aria-hidden="true"/><strong>{title}</strong></div></div>
-        <div className="actions"><span className="timezone">Asia/Kolkata · IST</span><Button variant="ghost" size="icon-sm" aria-label="Refresh workspace" onClick={() => { void cache.invalidateQueries({ queryKey: [scope] }) }}><RefreshCw size={15} aria-hidden="true"/></Button><Button variant="ghost" size="icon-sm" aria-label="Change password" onClick={() => setPassword(true)}><KeyRound size={15} aria-hidden="true"/></Button></div>
+        <div className="actions"><span className="timezone">Asia/Kolkata · IST</span><Notifications/><Button variant="ghost" size="icon-sm" aria-label="Refresh workspace" onClick={() => { void cache.invalidateQueries({ queryKey: [scope] }) }}><RefreshCw size={15} aria-hidden="true"/></Button><Button variant="ghost" size="icon-sm" aria-label="Change password" onClick={() => setPassword(true)}><KeyRound size={15} aria-hidden="true"/></Button></div>
       </header>
-      <main id="main-content" className="page-content"><Routes><Route path="/tickets" element={<TicketsPage/>}/><Route path="/customers" element={office ? <CustomersPage/> : <Navigate to="/tickets" replace/>}/><Route path="/outages" element={<OutagesPage/>}/><Route path="/reports" element={office ? <ReportsPage/> : <Navigate to="/tickets" replace/>}/><Route path="/performance" element={profile.role === 'owner' ? <PerformancePage/> : <Navigate to="/tickets" replace/>}/><Route path="/team" element={profile.role === 'owner' ? <TeamPage/> : <Navigate to="/tickets" replace/>}/><Route path="*" element={<Navigate to="/tickets" replace/>}/></Routes></main>
+      <main id="main-content" className="page-content"><Routes><Route path="/tickets" element={<TicketsPage/>}/><Route path="/attendance" element={<AttendancePage/>}/><Route path="/customers" element={office ? <CustomersPage/> : <Navigate to="/tickets" replace/>}/><Route path="/outages" element={<OutagesPage/>}/><Route path="/reports" element={office ? <ReportsPage/> : <Navigate to="/tickets" replace/>}/><Route path="/performance" element={profile.role === 'owner' ? <PerformancePage/> : <Navigate to="/tickets" replace/>}/><Route path="/team" element={profile.role === 'owner' ? <TeamPage/> : <Navigate to="/tickets" replace/>}/><Route path="*" element={<Navigate to="/tickets" replace/>}/></Routes></main>
     </div>
     {password && <PasswordDialog api={api} companyName={company.name} onClose={() => setPassword(false)} onSuccess={() => { toast.success(demo ? 'Demo password change simulated' : 'Password changed'); setPassword(false); void cache.invalidateQueries() }}/>}
   </div>

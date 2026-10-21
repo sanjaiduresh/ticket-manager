@@ -84,10 +84,10 @@ export function installImages(app, { db, client, media, throttle }) {
 
 // Safe to run periodically or on restart. Never removes a ready attachment.
 // Pending upload timeout is one hour, far beyond the remote request's 60s limit.
-export async function cleanupImages(db, media) {
+export async function cleanupImages(db, media, scope = {}) {
   if (!media) return
   const stale = new Date(Date.now() - 60 * 60000).toISOString()
-  const cursor = db.collection('images').find({ $or: [{ state: 'deleting' }, { state: 'pending', created_at: { $lt: stale } }] })
+  const cursor = db.collection('images').find({ ...scope, $or: [{ state: 'deleting' }, { state: 'pending', created_at: { $lt: stale } }] })
   for await (const image of cursor) {
     const claimed = await db.collection('images').findOneAndUpdate({ id: image.id, company_id: image.company_id, state: image.state }, { $set: { state: 'deleting' } }, { returnDocument: 'after' })
     if (!claimed) continue

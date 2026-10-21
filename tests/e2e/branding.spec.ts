@@ -35,7 +35,8 @@ test('DSA brand and Lucide icons retain NISS provider identity', async ({ page }
   await expect(sidebarIcon).toHaveAttribute('aria-hidden', 'true')
   expect(await sidebarIcon.locator('path').evaluateAll(paths => paths.map(path => path.getAttribute('d')))).toEqual(brandPaths)
   const navigation = page.getByRole('navigation', { name: 'Main navigation' })
-  await expect(navigation.locator('svg.lucide[aria-hidden="true"]')).toHaveCount(6)
+  await expect(navigation.locator('svg.lucide[aria-hidden="true"]')).toHaveCount(7)
+  await expect(navigation.getByRole('link', { name: 'Attendance', exact: true })).toBeVisible()
   await expect(navigation.getByRole('link', { name: 'Performance', exact: true })).toBeVisible()
 
   const table = page.locator('.desktop-table')

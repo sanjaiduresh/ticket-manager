@@ -60,10 +60,13 @@ async function ticketFixture(page: Page, failures: { error: object; commit?: boo
   // Reuse Vite's exact optimized URL (including its version query) so the fixture
   // and production components share one React Query context, not two module copies.
   const runtimeSource = await (await page.request.get('/src/lib/runtime.tsx')).text()
+  const ticketSource = await (await page.request.get('/src/features/tickets.tsx')).text()
+  const routerUrl = ticketSource.match(/from ["']([^"']+react-router-dom[^"']*)["']/)?.[1]
   const queryUrl = runtimeSource.match(/from ["']([^"']+@tanstack_react-query[^"']*)["']/)?.[1]
   const reactUrl = runtimeSource.match(/from ["']([^"']+\/react\.js[^"']*)["']/)?.[1]
   if (!queryUrl) throw new Error('Could not locate the local React Query module')
   if (!reactUrl) throw new Error('Could not locate the local React module')
+  if (!routerUrl) throw new Error('Could not locate the local React Router module')
   await page.route('**/__ticket-test', route => route.fulfill({ contentType: 'text/html', body: `
     <html><body><div id="root"></div><script type="module">
       import RefreshRuntime from '/@react-refresh';
@@ -74,6 +77,7 @@ async function ticketFixture(page: Page, failures: { error: object; commit?: boo
       import React from '${reactUrl}';
       import ReactDOM from '/node_modules/.vite/deps/react-dom_client.js';
       import { QueryClient, QueryClientProvider, useQuery } from '${queryUrl}';
+      import { MemoryRouter } from '${routerUrl}';
       import { TicketsPage } from '/src/features/tickets.tsx';
       import { RuntimeContext } from '/src/lib/runtime.tsx';
       import { createDemoApi } from '/src/lib/demo.ts';
@@ -128,7 +132,7 @@ async function ticketFixture(page: Page, failures: { error: object; commit?: boo
         await client.invalidateQueries({ queryKey: ['test', 'data'] });
       };
       ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(QueryClientProvider,
-        { client }, React.createElement(Fixture)));
+        { client }, React.createElement(MemoryRouter, null, React.createElement(Fixture))));
     </script></body></html>` }))
   await page.goto('/__ticket-test')
   await expect(page.getByRole('heading', { name: role === 'technician' ? 'My jobs' : 'Ticket queue' })).toBeVisible()

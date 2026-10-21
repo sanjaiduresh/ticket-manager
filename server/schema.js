@@ -18,8 +18,10 @@ export const customerSchema = z.strictObject({ full_name: text(200, 1), phone: t
 export const ticketSchema = z.strictObject({ id: uuid, connection_id: uuid.nullable().default(null), title: text(500, 1), description: text(20000), category: text(200, 1), priority, assigned_to: assignment, due_at: date, outage_id: uuid.nullable() })
 export const updateSchema = z.strictObject({ version: z.number().int().positive(), patch: z.strictObject({ status, title: text(500, 1), description: text(20000), priority, assigned_to: assignment, outage_id: uuid.nullable(), provider_reference: text(500), due_at: date, visit_at: date, follow_up_at: date, resolution: text(20000), customer_feedback: text(20000) }).partial(), note: text(20000) })
 export const outageSchema = z.strictObject({ provider_id: provider, area: text(200, 1), title: text(500, 1) })
+export const whatsappNumber = z.string().trim().regex(/^(?:\+[1-9]\d{6,14})?$/, 'Use + followed by country code and number (7–15 digits), or leave blank')
 export const staffSchema = z.discriminatedUnion('action', [
-  z.strictObject({ action: z.literal('create'), full_name: text(200, 1), email, password, role: z.enum(['office', 'technician']) }),
+  z.strictObject({ action: z.literal('create'), full_name: text(200, 1), email, password, role: z.enum(['office', 'technician']), whatsapp_number: whatsappNumber.optional() }),
+  z.strictObject({ action: z.literal('set_whatsapp'), id: uuid, whatsapp_number: whatsappNumber }),
   z.strictObject({ action: z.literal('update'), id: uuid, role: z.enum(['office', 'technician']).optional(), active: z.boolean().optional() }),
   z.strictObject({ action: z.literal('reset_password'), id: uuid, password }),
   z.strictObject({ action: z.literal('change_password'), password }),

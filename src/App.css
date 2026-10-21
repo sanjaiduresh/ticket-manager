@@ -1,3 +1,34 @@
+.ticket-whatsapp { margin: 24px 0; padding: 18px; border: 1px solid #d6e6dc; border-radius: 9px; background: #f6faf7; }
+.ticket-whatsapp h2 { display: flex; align-items: center; gap: 8px; font-size: 15px; font-weight: 650; color: #285b42; }
+.ticket-whatsapp p { font-size: 12px; line-height: 1.7; margin: 10px 0; }
+.ticket-whatsapp summary { font-size: 12px; cursor: pointer; color: #285b42; }
+.ticket-whatsapp .whatsapp-message { white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; border-radius: 6px; background: white; }
+.ticket-whatsapp ul { list-style: none; padding: 0; display: grid; gap: 12px; margin-top: 14px; }
+.ticket-whatsapp li { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding-top: 12px; border-top: 1px solid #d6e6dc; }
+.ticket-whatsapp li > div { flex: 1; min-width: 140px; }
+.ticket-whatsapp li strong { font-size: 12px; }
+.ticket-whatsapp small { display: block; margin-top: 4px; font-size: 11px; color: #52695c; }
+.whatsapp-send { display: inline-flex; align-items: center; justify-content: center; gap: 7px; padding: 8px 12px; border-radius: 6px; background: #176443; color: white; font-size: 12px; font-weight: 600; text-decoration: none; }
+.whatsapp-send:hover { background: #124e34; }
+.whatsapp-send:focus-visible { outline: 3px solid var(--ring); outline-offset: 3px; }
+.attendance-clock { display: flex; align-items: center; gap: 18px; padding: 24px; margin-bottom: 16px; background: linear-gradient(115deg, #f0faf6, #fff); }
+.attendance-clock-icon { display: grid; place-items: center; width: 48px; height: 48px; border-radius: 14px; background: #deeee6; color: #087d70; flex-shrink: 0; }
+.attendance-clock h2 { font-size: 18px; font-weight: 650; color: #294d3d; }
+.attendance-clock p { margin-top: 6px; font-size: 12px; color: #52695c; }
+.attendance-clock > button { margin-left: auto; flex-shrink: 0; }
+.attendance-help { font-size: 12px; color: #64736a; line-height: 1.7; margin-bottom: 24px; }
+.attendance-error { padding: 20px; }
+.notification-bell { position: relative; gap: 4px; }
+.notification-count { border-radius: 10px; background: #087d70; color: white; padding: 1px 5px; font-size: 10px; }
+.notification-controls { display: flex; flex-wrap: wrap; gap: 8px; }
+.notification-list { list-style: none; padding: 0; margin-top: 14px; display: grid; gap: 10px; }
+.notification-list li { border: 1px solid var(--border); border-radius: 8px; padding: 14px; display: grid; gap: 12px; }
+.notification-list li.notification-unread { background: #f0faf6; border-left: 3px solid #087d70; }
+.notification-list strong, .notification-list span, .notification-list small { display: block; }
+.notification-list strong { font-size: 13px; }
+.notification-list span { font-size: 12px; margin: 5px 0; }
+.notification-list small { font-size: 11px; color: #64736a; }
+@media (max-width: 600px) { .attendance-clock { flex-wrap: wrap; padding: 18px; } .attendance-clock > button { margin-left: 0; width: 100%; } .attendance-clock > div:nth-child(2) { flex: 1; min-width: 160px; } }
 .ticket-images { margin-top: 1.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); }
 .ticket-images h2 { font-size: 1rem; font-weight: 650; }
 .ticket-images > p { margin: .6rem 0; font-size: .85rem; }

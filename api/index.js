@@ -2,11 +2,14 @@ import { MongoClient } from 'mongodb'
 import { createApp } from '../server/app.js'
 import { initializeDatabase } from '../server/database.js'
 import { cloudinaryMedia } from '../server/cloudinary.js'
+import { cleanupImages } from '../server/images.js'
 
 // Cache the app and MongoDB client across serverless warm invocations.
 // A cold start re-runs the setup; a warm invocation reuses the connection.
 let cachedApp = null
 let cachedClient = null
+let cachedMedia = null
+let lastImageSweep = 0
 
 export default async function handler(req, res) {
   if (!cachedApp) {
@@ -59,6 +62,7 @@ export default async function handler(req, res) {
       }
       await initializeDatabase(db)
       const media = cloudinaryMedia(process.env.CLOUDINARY_URL)
+      cachedMedia = media
 
       cachedApp = await createApp({
         db,
@@ -86,5 +90,12 @@ export default async function handler(req, res) {
     }
   }
 
+  // Serverless has no reliable interval: await maintenance on cold starts and
+  // periodic incoming requests rather than leaving work after the response.
+  if (cachedMedia && Date.now() - lastImageSweep >= 15 * 60000) {
+    lastImageSweep = Date.now()
+    try { await cleanupImages(cachedClient.db(process.env.MONGODB_DB || 'dsa_service_desk'), cachedMedia) }
+    catch (error) { console.error('Image cleanup deferred', { type: error.name }) }
+  }
   return cachedApp(req, res)
 }

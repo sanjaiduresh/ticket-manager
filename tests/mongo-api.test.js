@@ -9,6 +9,7 @@ import { initializeDatabase } from '../server/database.js'
 import { cleanupImages, sanitizeImage } from '../server/images.js'
 import { digest, limit, verifyPassword } from '../server/security.js'
 import { performanceMetrics, performanceRange } from '../server/performance.js'
+import { attendanceDay } from '../server/attendance.js'
 
 // No server entrypoint, dotenv, Atlas URI or real media adapter is imported.
 // A real replica set supplies snapshot isolation, unique indexes and transaction retries.
@@ -93,6 +94,26 @@ function noMediaCalls() {
   expect(media.destroy).not.toHaveBeenCalled()
 }
 
+// Change access after authentication returns its old profile, before the real
+// transaction re-reads membership. Keep MongoDB/session behavior unmocked.
+async function afterAuthentication(actor, change, work) {
+  const prototype = Object.getPrototypeOf(db.collection('users'))
+  const original = prototype.findOne
+  let changed = false
+  const spy = vi.spyOn(prototype, 'findOne').mockImplementation(async function (filter, options) {
+    const result = await original.call(this, filter, options)
+    if (this.collectionName === 'users' && filter.id === actor.id && !options?.session && !changed) {
+      changed = true
+      await change()
+    }
+    return result
+  })
+  try {
+    await work()
+    expect(changed).toBe(true)
+  } finally { spy.mockRestore() }
+}
+
 describe('MongoDB API integration (isolated replica set)', () => {
   beforeAll(async () => {
     replSet = await MongoMemoryReplSet.create({ replSet: { count: 1, storageEngine: 'wiredTiger', ip: '127.0.0.1' } })
@@ -137,6 +158,713 @@ describe('MongoDB API integration (isolated replica set)', () => {
     try { if (client) await client.close() }
     finally { if (replSet) await replSet.stop() }
   }, 60000)
+
+  describe('private WhatsApp staff contacts', () => {
+    const contact = (actor, id, whatsapp_number) => mutate('post', '/api/staff', actor, { action: 'set_whatsapp', id, whatsapp_number })
+    it('lets only the owner save/remove contacts without revoking employee sessions', async () => {
+      const before = await db.collection('users').findOne({ id: tech.id })
+      await contact(a, tech.id, ' +12025550123 ').expect(200)
+      const saved = await db.collection('users').findOne({ id: tech.id })
+      expect(saved.whatsapp_number).toBe('+12025550123')
+      expect(saved.auth_version).toBe(before.auth_version)
+      await get('/api/workspace', tech).expect(200)
+      expect(await db.collection('staff_audit').countDocuments({ target_id: tech.id, action: 'whatsapp_contact_updated', actor_id: a.id })).toBe(1)
+      for (const actor of [officeStaff, tech]) await contact(actor, otherTech.id, '+12025550124').expect(403)
+      await contact(b, tech.id, '+12025550124').expect(404)
+      await contact(a, a.id, '+12025550124').expect(403)
+      await contact(a, tech.id, '').expect(200)
+      expect((await db.collection('users').findOne({ id: tech.id })).whatsapp_number).toBe('')
+    })
+    it('exposes contacts only to same-company owner/office, not technicians or public profiles', async () => {
+      await contact(a, tech.id, '+12025550123').expect(200)
+      for (const actor of [a, officeStaff]) {
+        const result = (await get('/api/workspace', actor).expect(200)).body
+        expect(result.profiles.find(p => p.id === tech.id).whatsapp_number).toBe('+12025550123')
+      }
+      for (const actor of [tech, otherTech]) {
+        const result = (await get('/api/workspace', actor).expect(200)).body
+        expect(result.profiles.every(p => !('whatsapp_number' in p))).toBe(true)
+      }
+      expect((await get('/api/profile', tech).expect(200)).body).not.toHaveProperty('whatsapp_number')
+      expect(JSON.stringify((await get('/api/workspace', b).expect(200)).body)).not.toContain('+12025550123')
+    })
+    it('validates numbers on creation/updates and preserves the prior contact on rejection', async () => {
+      await contact(a, tech.id, '+12025550123').expect(200)
+      for (const phone of [null, 12345, {}, '+01234567', '12025550123', '+123', '+1234567890123456', '+1202&text=secret', '+1 202 555 0123']) {
+        await contact(a, tech.id, phone).expect(400)
+        await mutate('post', '/api/staff', a, { action: 'create', full_name: 'Test', email: 'invalid-contact@example.test', password, role: 'technician', whatsapp_number: phone }).expect(400)
+      }
+      expect((await db.collection('users').findOne({ id: tech.id })).whatsapp_number).toBe('+12025550123')
+      await mutate('post', '/api/staff', a, { action: 'create', full_name: 'WhatsApp staff', email: 'contact@example.test', password, role: 'technician', whatsapp_number: '+12025550124' }).expect(200)
+      expect((await db.collection('users').findOne({ email: 'contact@example.test' })).whatsapp_number).toBe('+12025550124')
+    })
+  })
+
+  describe('office-managed daily attendance', () => {
+    const day = '2024-02-10'
+    const url = (from = day, to = from) => `/api/attendance?from=${from}&to=${to}`
+    const input = (extra = {}) => ({ id: randomUUID(), employee_id: tech.id, day, version: 0,
+      status: 'present', check_in: null, check_out: null, note: '', ...extra })
+    const save = (actor, body) => mutate('post', '/api/attendance', actor, body)
+    const stored = id => db.collection('attendance').findOne({ id })
+    const audits = id => db.collection('attendance_audit').find({ attendance_id: id }).sort({ 'after.version': 1 }).toArray()
+
+    it('allows office creation and owner correction with immutable, server-stamped actor audits', async () => {
+      const body = input({ note: '  Office register  ' })
+      const before = Date.now()
+      await save(officeStaff, body).expect(200)
+      const first = await stored(body.id)
+      expect(first).toMatchObject({ ...body, note: 'Office register', company_id: a.company_id, version: 1,
+        recorded_by: officeStaff.id, updated_by: officeStaff.id })
+      expect(Date.parse(first.created_at)).toBeGreaterThanOrEqual(before)
+      expect(first.updated_at).toBe(first.created_at)
+      await save(a, { ...body, version: 1, status: 'half_day', note: 'Owner correction' }).expect(200)
+      const second = await stored(body.id)
+      expect(second).toMatchObject({ version: 2, status: 'half_day', note: 'Owner correction',
+        recorded_by: officeStaff.id, updated_by: a.id, created_at: first.created_at })
+      expect(Date.parse(second.updated_at)).toBeGreaterThanOrEqual(Date.parse(first.updated_at))
+      const history = await audits(body.id)
+      expect(history).toHaveLength(2)
+      const { _id: firstId, ...firstFields } = first
+      const { _id: secondId, ...secondFields } = second
+      expect(firstId).toBeDefined(); expect(secondId).toBeDefined()
+      expect(history[0]).toMatchObject({ company_id: a.company_id, attendance_id: body.id, employee_id: tech.id,
+        actor_id: officeStaff.id, before: null, after: firstFields, created_at: first.updated_at })
+      expect(history[1]).toMatchObject({ actor_id: a.id, before: firstFields, after: secondFields, created_at: second.updated_at })
+      expect(history[0].id).not.toBe(history[1].id)
+    })
+
+    it('denies technician creates/edits and disables both old punch routes for every role', async () => {
+      const body = input()
+      await save(a, body).expect(200)
+      const before = await stored(body.id)
+      for (const actor of [tech, otherTech]) {
+        await save(actor, input({ employee_id: actor.id })).expect(403)
+        await save(actor, { ...body, version: 1, status: 'absent' }).expect(403)
+      }
+      for (const actor of [a, officeStaff, tech, otherTech, b]) {
+        for (const route of ['check-in', 'check-out']) {
+          await mutate('post', `/api/attendance/${route}`, actor, { id: body.id }).expect(403)
+        }
+      }
+      expect(await stored(body.id)).toEqual(before)
+      expect(await db.collection('attendance').countDocuments()).toBe(1)
+      expect(await audits(body.id)).toHaveLength(1)
+    })
+
+    it('scopes inclusive daily reads to the company or the technician and rejects scope injection', async () => {
+      for (const employee of [a, b, tech, otherTech, officeStaff]) {
+        await save(employee.id === b.id ? b : officeStaff, input({ employee_id: employee.id })).expect(200)
+      }
+      await save(a, input({ day: '2024-02-09' })).expect(200)
+      await save(a, input({ day: '2024-02-11' })).expect(200)
+      for (const actor of [a, officeStaff]) {
+        const result = (await get(url(), actor).expect(200)).body
+        expect(result).toMatchObject({ from: day, to: day, generated_at: expect.any(String) })
+        expect(result.records.map(row => row.employee_id).sort()).toEqual([a.id, tech.id, otherTech.id, officeStaff.id].sort())
+        expect(result.records.every(row => row.company_id === a.company_id && row.day === day && !('_id' in row))).toBe(true)
+      }
+      for (const actor of [tech, otherTech, b]) {
+        expect((await get(url(), actor).expect(200)).body.records.map(row => row.employee_id)).toEqual([actor.id])
+      }
+      expect((await get(url('2024-02-09', '2024-02-11'), tech).expect(200)).body.records.map(row => row.day))
+        .toEqual(['2024-02-11', day, '2024-02-09'])
+      expect((await get(url('2024-02-12'), a).expect(200)).body.records).toEqual([])
+      for (const query of ['from=2024-02-30&to=2024-03-01', 'from=2024-02-11&to=2024-02-10',
+        'from=2020-01-01&to=2026-01-01', `from=${day}&to=${day}&company_id=${b.company_id}`,
+        `from=${day}&to=${day}&employee_id=${otherTech.id}`, `from[$ne]=x&to=${day}`, '']) {
+        await get(`/api/attendance?${query}`, tech).expect(400)
+      }
+    })
+
+    it.each(['present', 'absent', 'half_day', 'leave'])('accepts %s with null times on consecutive days', async status => {
+      for (const date of [day, '2024-02-11']) {
+        const body = input({ day: date, status })
+        await save(officeStaff, body).expect(200)
+        expect(await stored(body.id)).toMatchObject({ status, check_in: null, check_out: null, version: 1 })
+      }
+      expect(await db.collection('attendance').countDocuments()).toBe(2)
+      expect(await db.collection('attendance_audit').countDocuments()).toBe(2)
+    })
+
+    it('normalizes offset times, allows optional check-out and overnight/equal check-out', async () => {
+      expect(attendanceDay('2024-02-09T18:29:59.999Z')).toBe('2024-02-09')
+      expect(attendanceDay('2024-02-09T18:30:00.000Z')).toBe(day)
+      const body = input({ check_in: `${day}T00:00:00+05:30` })
+      await save(a, body).expect(200)
+      expect(await stored(body.id)).toMatchObject({ check_in: '2024-02-09T18:30:00.000Z', check_out: null })
+      await save(a, { ...body, version: 1, check_out: body.check_in }).expect(200)
+      await save(officeStaff, { ...body, version: 2, status: 'half_day', check_out: '2024-02-11T01:00:00+05:30' }).expect(200)
+      expect(await stored(body.id)).toMatchObject({ version: 3, status: 'half_day', check_out: '2024-02-10T19:30:00.000Z' })
+      const end = input({ employee_id: otherTech.id, check_in: '2024-02-10T18:29:59.999Z' })
+      await save(a, end).expect(200)
+    })
+
+    it('rejects invalid status, calendar dates, future or inconsistent times and forged fields without writes', async () => {
+      const future = new Date(Date.now() + 2 * 86400000).toISOString()
+      const today = attendanceDay(new Date().toISOString())
+      const futureSameDay = `${today}T23:59:59.999+05:30`
+      const invalid = [
+        ...['', 'late', 'PRESENT', null, 1].map(status => ({ status })),
+        ...['2024-02-30', '2023-02-29', '2024-2-10', 'not-a-date', attendanceDay(future)].map(day => ({ day })),
+        { check_in: '2024-02-09T18:29:59.999Z' }, { check_in: '2024-02-10T18:30:00.000Z' },
+        { check_out: `${day}T10:00:00Z` }, { check_in: `${day}T10:00:00Z`, check_out: `${day}T09:59:59Z` },
+        { check_in: `${day}T10:00:00` }, { check_in: 'invalid' }, { check_out: 'invalid' },
+        { day: today, check_in: futureSameDay }, { check_in: `${day}T10:00:00Z`, check_out: future },
+        ...['absent', 'leave'].flatMap(status => [{ status, check_in: `${day}T10:00:00Z` },
+          { status, check_in: `${day}T10:00:00Z`, check_out: `${day}T11:00:00Z` }]),
+        { id: 'invalid' }, { employee_id: 'invalid' }, { version: -1 }, { version: 0.5 }, { version: '0' },
+        { note: null }, { note: 'x'.repeat(2001) },
+        ...['company_id', 'recorded_by', 'updated_by', 'actor_id', 'created_at', 'updated_at'].map(key => ({ [key]: b.id })),
+      ]
+      for (const fields of invalid) await save(a, input(fields)).expect(400)
+      const valid = input()
+      for (const key of Object.keys(valid)) {
+        await save(a, Object.fromEntries(Object.entries(valid).filter(([field]) => field !== key))).expect(400)
+      }
+      expect(await db.collection('attendance').countDocuments()).toBe(0)
+      expect(await db.collection('attendance_audit').countDocuments()).toBe(0)
+      await save(a, input({ day: '2024-02-29', note: 'x'.repeat(2000) })).expect(200)
+    })
+
+    it('denies unknown/foreign employees, foreign UUID reuse and changes to daily record identity', async () => {
+      const body = input()
+      await save(a, body).expect(200)
+      const before = await stored(body.id)
+      for (const employee_id of [b.id, randomUUID()]) await save(officeStaff, input({ employee_id })).expect(404)
+      await save(a, input({ version: 1 })).expect(404)
+      await save(b, { ...body, employee_id: b.id, version: 1 }).expect(404)
+      await save(b, { ...body, employee_id: b.id }).expect(409)
+      for (const fields of [{ employee_id: otherTech.id }, { day: '2024-02-11' }]) {
+        await save(a, { ...body, ...fields, version: 1 }).expect(400)
+      }
+      expect(await stored(body.id)).toEqual(before)
+      expect(await db.collection('attendance').countDocuments()).toBe(1)
+      expect(await db.collection('attendance_audit').countDocuments()).toBe(1)
+    })
+
+    it('serializes duplicate daily creates and identical UUID retries without duplicate audits', async () => {
+      const body = input()
+      const retries = await Promise.all(Array.from({ length: 4 }, () => save(officeStaff, body)))
+      expect(retries.map(result => result.status)).toEqual([200, 200, 200, 200])
+      expect(await audits(body.id)).toHaveLength(1)
+      const bodies = Array.from({ length: 4 }, () => input({ day: '2024-02-11' }))
+      const results = await Promise.all(bodies.map(body => save(a, body)))
+      expect(results.map(result => result.status).sort()).toEqual([200, 409, 409, 409])
+      const winner = bodies[results.findIndex(result => result.status === 200)]
+      expect(await stored(winner.id)).toMatchObject({ version: 1, employee_id: tech.id, day: '2024-02-11' })
+      expect(await db.collection('attendance').countDocuments()).toBe(2)
+      expect(await db.collection('attendance_audit').countDocuments()).toBe(2)
+    }, 30000)
+
+    it('rejects stale competing edits while accepting only exact same-actor retries and current no-ops', async () => {
+      const body = input()
+      await save(officeStaff, body).expect(200)
+      const edits = ['absent', 'leave'].map(status => ({ ...body, status, version: 1 }))
+      const results = await Promise.all(edits.map(body => save(a, body)))
+      expect(results.map(result => result.status).sort()).toEqual([200, 409])
+      const winner = edits[results.findIndex(result => result.status === 200)]
+      const before = await stored(body.id)
+      await save(a, winner).expect(200)
+      await save(officeStaff, winner).expect(409) // Same payload is not the other actor's retry.
+      await save(a, { ...winner, note: 'Stale different content' }).expect(409)
+      await save(a, { ...winner, version: 0 }).expect(409)
+      await save(a, { ...winner, version: 99 }).expect(409)
+      await save(officeStaff, { ...winner, version: 2 }).expect(200) // Current no-op, no ownership rewrite.
+      expect(await stored(body.id)).toEqual(before)
+      expect(await audits(body.id)).toHaveLength(2)
+    })
+
+    it('migrates the legacy open-punch index and normalizes legacy reads and audited updates', async () => {
+      const legacy = { id: randomUUID(), company_id: a.company_id, employee_id: tech.id, day,
+        check_in: `${day}T04:00:00.000Z`, check_out: null }
+      // The driver adds _id to its argument; keep the expected public fixture untouched.
+      await db.collection('attendance').insertOne({ ...legacy })
+      await db.collection('attendance').createIndex({ company_id: 1, employee_id: 1 },
+        { unique: true, partialFilterExpression: { check_out: null } })
+      try {
+        await initializeDatabase(db)
+        await initializeDatabase(db) // Startup migration must be repeatable.
+        expect((await db.collection('attendance').indexes()).map(index => index.name)).not.toContain('company_id_1_employee_id_1')
+        const read = (await get(url(), tech).expect(200)).body.records[0]
+        expect(read).toEqual({ ...legacy, status: 'present', note: '', version: 1,
+          recorded_by: null, updated_by: null, updated_at: null })
+        expect(await stored(legacy.id)).not.toHaveProperty('version') // GET is not a write migration.
+        const correction = input({ id: legacy.id, version: 1, check_in: legacy.check_in, note: 'Legacy correction' })
+        await save(officeStaff, correction).expect(200)
+        const migrated = await stored(legacy.id)
+        expect(migrated).toMatchObject({ version: 2, recorded_by: null, updated_by: officeStaff.id,
+          created_at: legacy.check_in, note: correction.note })
+        await save(officeStaff, correction).expect(200)
+        expect(await stored(legacy.id)).toEqual(migrated)
+        const history = await audits(legacy.id)
+        expect(history).toHaveLength(1)
+        expect(history[0]).toMatchObject({ before: read, actor_id: officeStaff.id, after: { version: 2, recorded_by: null } })
+        await save(a, input({ day: '2024-02-11', status: 'leave' })).expect(200)
+        await save(a, input({ day: '2024-02-12', status: 'absent' })).expect(200)
+        await save(a, input({ day: '2024-02-11' })).expect(409)
+      } finally {
+        // Do not let a migration regression contaminate later tests' indexes.
+        if ((await db.collection('attendance').indexes()).some(index => index.name === 'company_id_1_employee_id_1')) {
+          await db.collection('attendance').dropIndex('company_id_1_employee_id_1')
+        }
+      }
+    })
+
+    it('serializes identical correction retries and rolls back a correction if its audit cannot be saved', async () => {
+      const body = input()
+      await save(officeStaff, body).expect(200)
+      const correction = { ...body, version: 1, status: 'leave', note: 'Approved leave' }
+      const results = await Promise.all(Array.from({ length: 4 }, () => save(a, correction)))
+      expect(results.map(result => result.status)).toEqual([200, 200, 200, 200])
+      const before = await stored(body.id)
+      const history = await audits(body.id)
+      expect(before).toMatchObject({ version: 2, status: 'leave', recorded_by: officeStaff.id, updated_by: a.id })
+      expect(history).toHaveLength(2)
+      const prototype = Object.getPrototypeOf(db.collection('attendance_audit'))
+      const original = prototype.insertOne
+      let failed = false
+      const spy = vi.spyOn(prototype, 'insertOne').mockImplementation(async function (document, options) {
+        if (this.collectionName === 'attendance_audit') {
+          failed = true
+          throw new Error('Simulated attendance audit failure')
+        }
+        return original.call(this, document, options)
+      })
+      try {
+        await save(officeStaff, { ...body, version: 2, status: 'absent' }).expect(503)
+        await save(officeStaff, input({ day: '2024-02-11' })).expect(503)
+      } finally { spy.mockRestore() }
+      expect(failed).toBe(true)
+      expect(await stored(body.id)).toEqual(before)
+      expect(await audits(body.id)).toEqual(history)
+      expect(await db.collection('attendance').countDocuments()).toBe(1)
+      expect(await db.collection('attendance_audit').countDocuments()).toBe(2)
+    }, 30000)
+
+    it('denies anonymous, password-gated, reset, demoted, deactivated and logged-out sessions', async () => {
+      await get(url()).expect(401)
+      await save(null, input()).expect(401)
+      const pending = await staff(a, 'attendance-pending@example.test', 'office', false)
+      await get(url(), pending).expect(403)
+      await save(pending, input()).expect(403)
+      await mutate('post', '/api/staff', a, { action: 'reset_password', id: officeStaff.id, password }).expect(200)
+      await get(url(), officeStaff).expect(401)
+      await save(officeStaff, input()).expect(401)
+      const reset = await login(officeStaff.email)
+      await get(url(), reset).expect(403)
+      await save(reset, input()).expect(403)
+      await mutate('post', '/api/staff', a, { action: 'update', id: pending.id, role: 'technician' }).expect(200)
+      await save(pending, input()).expect(401)
+      await mutate('post', '/api/staff', a, { action: 'update', id: tech.id, active: false }).expect(200)
+      await get(url(), tech).expect(401)
+      await mutate('post', '/api/auth/logout', a, {}).expect(200)
+      await get(url(), a).expect(401)
+      await save(a, input()).expect(401)
+      expect(await db.collection('attendance').countDocuments()).toBe(0)
+      expect(await db.collection('attendance_audit').countDocuments()).toBe(0)
+    })
+
+    it.each(['role', 'password', 'revocation', 'logout'])('rechecks %s after authentication before attendance writes', async mode => {
+      const change = () => mode === 'logout'
+        ? db.collection('sessions').deleteOne({ _id: digest(officeStaff.cookie.split('=')[1]) })
+        : db.collection('users').updateOne({ id: officeStaff.id }, mode === 'revocation'
+          ? { $inc: { auth_version: 1 } }
+          : { $set: mode === 'role' ? { role: 'technician' } : { must_change_password: true } })
+      await afterAuthentication(officeStaff, change, () => save(officeStaff, input()).expect(['role', 'password'].includes(mode) ? 403 : 401))
+      expect(await db.collection('attendance').countDocuments()).toBe(0)
+      expect(await db.collection('attendance_audit').countDocuments()).toBe(0)
+    })
+
+    it.each(['auth_version', 'must_change_password', 'active', 'company_id'])('rechecks %s before reading the attendance snapshot', async field => {
+      await save(a, input()).expect(200)
+      const change = () => db.collection('users').updateOne({ id: officeStaff.id }, field === 'auth_version'
+        ? { $inc: { auth_version: 1 } } : { $set: { [field]: field === 'active' ? false : field === 'company_id' ? b.company_id : true } })
+      await afterAuthentication(officeStaff, change, async () => {
+        const result = await get(url(), officeStaff).expect(403)
+        expect(result.body).not.toHaveProperty('records')
+      })
+    })
+  })
+
+  describe('ticket deletion', () => {
+    const deletion = (item = ticketA, extra = {}) => ({ version: item.version, confirmation: `DSA-${item.number}`,
+      reason: 'Duplicate service request', ...extra })
+    const remove = (actor, item = ticketA, body = deletion(item)) => mutate('delete', `/api/tickets/${item.id}`, actor, body)
+    const snapshot = async names => Promise.all(names.map(async name => [name, await db.collection(name).find().sort({ id: 1 }).toArray()]))
+    const affected = ['tickets', 'events', 'notifications', 'images', 'ticket_deletions', 'staff_audit']
+
+    it.each(['owner', 'office'])('%s deletion commits ticket/event/notification removal and audit before scoped remote cleanup', async role => {
+      const actor = role === 'owner' ? a : officeStaff
+      const item = await ticket(a, connectionA, { assigned_to: [tech.id, otherTech.id], outage_id: outageA.id })
+      const ready = await seedImage(item)
+      const unrelated = await seedImage(otherTicket, 'deleting')
+      // Deliberately inconsistent foreign rows test both dimensions of cleanup scope.
+      const foreignItem = { ...item, company_id: b.company_id }
+      const foreign = await seedImage(foreignItem, 'deleting')
+      await db.collection('events').insertOne({ id: randomUUID(), company_id: b.company_id, ticket_id: item.id, body: 'foreign sentinel' })
+      await db.collection('notifications').insertOne({ id: randomUUID(), company_id: b.company_id, ticket_id: item.id, recipient_id: b.id })
+      const preservedNames = ['customers', 'connections', 'outages']
+      const preserved = await snapshot(preservedNames)
+      const unrelatedRows = await Promise.all(['tickets', 'events', 'notifications'].map(name => db.collection(name)
+        .find(name === 'tickets' ? { id: { $ne: item.id } } : { $or: [{ ticket_id: { $ne: item.id } }, { company_id: b.company_id }] })
+        .sort({ id: 1 }).toArray()))
+      expect(await db.collection('events').countDocuments({ ticket_id: item.id, company_id: a.company_id })).toBe(1)
+      expect(await db.collection('notifications').countDocuments({ ticket_id: item.id, company_id: a.company_id })).toBe(2)
+      const body = deletion(item, { reason: '  Duplicate service request  ' })
+      let committed
+      media.destroy.mockImplementationOnce(async publicId => {
+        // These independent reads must observe a committed deletion, not an open
+        // transaction that is waiting for a remote network operation.
+        committed = {
+          ticket: await db.collection('tickets').findOne({ id: item.id }),
+          events: await db.collection('events').countDocuments({ ticket_id: item.id, company_id: a.company_id }),
+          notifications: await db.collection('notifications').countDocuments({ ticket_id: item.id, company_id: a.company_id }),
+          image: await db.collection('images').findOne({ id: ready.id }),
+          marker: await db.collection('ticket_deletions').findOne({ id: item.id }),
+          audit: await db.collection('staff_audit').findOne({ target_id: item.id, action: 'ticket_deleted' }),
+        }
+        blobs.delete(publicId)
+      })
+      const before = Date.now()
+      expect((await remove(actor, item, body).expect(200)).body).toEqual({ ok: true })
+      expect(committed).toMatchObject({ ticket: null, events: 0, notifications: 0, image: { state: 'deleting' },
+        marker: { id: item.id, number: item.number, company_id: a.company_id, version: item.version,
+          confirmation: body.confirmation, reason: body.reason.trim(), actor_id: actor.id },
+        audit: { company_id: a.company_id, target_id: item.id, action: 'ticket_deleted', actor_id: actor.id } })
+      expect(Date.parse(committed.marker.created_at)).toBeGreaterThanOrEqual(before)
+      expect(await db.collection('ticket_deletions').countDocuments({ id: item.id })).toBe(1)
+      expect(await db.collection('staff_audit').countDocuments({ target_id: item.id, action: 'ticket_deleted' })).toBe(1)
+      expect(media.destroy).toHaveBeenCalledExactlyOnceWith(ready.public_id)
+      expect(blobs.has(ready.public_id)).toBe(false)
+      expect(await db.collection('images').findOne({ id: ready.id })).toBeNull()
+      for (const image of [unrelated, foreign]) {
+        expect(await db.collection('images').findOne({ id: image.id })).toMatchObject(image)
+        expect(blobs.has(image.public_id)).toBe(true)
+      }
+      expect(await snapshot(preservedNames)).toEqual(preserved)
+      for (const [index, name] of ['tickets', 'events', 'notifications'].entries()) {
+        expect(await db.collection(name).find(name === 'tickets' ? { id: { $ne: item.id } }
+          : { $or: [{ ticket_id: { $ne: item.id } }, { company_id: b.company_id }] }).sort({ id: 1 }).toArray()).toEqual(unrelatedRows[index])
+      }
+      for (const reader of [a, officeStaff, tech]) {
+        await get(`/api/tickets/${item.id}/events`, reader).expect(404)
+        await get(`/api/tickets/${item.id}/images`, reader).expect(404)
+        await get(`/api/tickets/${item.id}/images/${ready.id}/content`, reader).expect(404)
+        expect((await get('/api/workspace', reader).expect(200)).body.tickets.some(row => row.id === item.id)).toBe(false)
+      }
+      expect(media.download).not.toHaveBeenCalled()
+      expect(media.upload).not.toHaveBeenCalled()
+    })
+
+    it('denies anonymous, assigned/unassigned technicians, foreign tenants and unknown tickets without side effects', async () => {
+      await seedImage()
+      const before = await snapshot(affected)
+      await remove(null).expect(401)
+      for (const actor of [tech, otherTech]) await remove(actor).expect(403)
+      await remove(b).expect(404)
+      await remove(a, ticketB).expect(404)
+      await remove(a, { ...ticketA, id: randomUUID() }).expect(404)
+      await remove(a, { ...ticketA, id: 'not-a-uuid' }).expect(400)
+      expect(await snapshot(affected)).toEqual(before)
+      noMediaCalls()
+    })
+
+    it('strictly validates version, exact DSA confirmation, nonblank bounded reason and caller-supplied fields', async () => {
+      await seedImage()
+      const before = await snapshot(affected)
+      const valid = deletion()
+      const invalid = [
+        ...[0, -1, 1.5, '1', null].map(version => ({ ...valid, version })),
+        ...['', `dsa-${ticketA.number}`, `DSA-${ticketA.number + 1}`, ` DSA-${ticketA.number}`, `DSA-${ticketA.number} `,
+          ticketA.number, null, 'x'.repeat(81)].map(confirmation => ({ ...valid, confirmation })),
+        ...['', ' \n ', 'x'.repeat(501), null, 42].map(reason => ({ ...valid, reason })),
+        ...['actor_id', 'company_id', 'number', 'id', 'created_at'].map(key => ({ ...valid, [key]: b.id })),
+        ...Object.keys(valid).map(key => Object.fromEntries(Object.entries(valid).filter(([field]) => field !== key))),
+      ]
+      for (const body of invalid) await remove(a, ticketA, body).expect(400)
+      expect(await snapshot(affected)).toEqual(before)
+      noMediaCalls()
+      await remove(a, ticketA, deletion(ticketA, { reason: 'x'.repeat(500) })).expect(200)
+    })
+
+    it('rejects stale versions after an edit without deleting anything and accepts the current version', async () => {
+      await seedImage()
+      await patch(officeStaff, ticketA, { priority: 'high' }, 'Keep this edit').expect(200)
+      const before = await snapshot(affected)
+      await remove(a).expect(409)
+      await remove(a, ticketA, deletion(ticketA, { version: 99 })).expect(409)
+      expect(await snapshot(affected)).toEqual(before)
+      noMediaCalls()
+      await remove(a, ticketA, deletion(ticketA, { version: 2 })).expect(200)
+      expect(await db.collection('ticket_deletions').findOne({ id: ticketA.id })).toMatchObject({ version: 2, number: ticketA.number })
+    })
+
+    it('serializes concurrent exact retries into one marker/audit and rejects mismatched replay or UUID resurrection', async () => {
+      const body = deletion()
+      const results = await Promise.all(Array.from({ length: 4 }, () => remove(officeStaff, ticketA, body)))
+      expect(results.map(result => result.status)).toEqual([200, 200, 200, 200])
+      const before = await snapshot(affected)
+      await remove(officeStaff, ticketA, body).expect(200)
+      await remove(a, ticketA, body).expect(409)
+      await remove(tech, ticketA, body).expect(403)
+      await remove(b, ticketA, body).expect(404)
+      for (const fields of [{ version: 2 }, { confirmation: 'DSA-999999' }, { reason: 'Different reason' }]) {
+        await remove(officeStaff, ticketA, { ...body, ...fields }).expect(409)
+      }
+      const sequences = await Promise.all([a, b].map(actor => db.collection('companies').findOne({ id: actor.company_id })))
+      for (const [actor, connection] of [[a, connectionA], [b, connectionB]]) {
+        await mutate('post', '/api/tickets', actor, ticketInput(connection, { id: ticketA.id, assigned_to: null })).expect(409)
+      }
+      expect(await snapshot(affected)).toEqual(before)
+      expect(await db.collection('ticket_deletions').countDocuments({ id: ticketA.id })).toBe(1)
+      expect(await db.collection('staff_audit').countDocuments({ target_id: ticketA.id, action: 'ticket_deleted' })).toBe(1)
+      for (const company of sequences) {
+        expect((await db.collection('companies').findOne({ id: company.id })).ticket_sequence).toBe(company.ticket_sequence)
+      }
+      const replacement = await ticket(a, connectionA)
+      expect(replacement.id).not.toBe(ticketA.id)
+      expect(replacement.number).toBe(sequences[0].ticket_sequence + 1)
+      noMediaCalls()
+    }, 30000)
+
+    it('serializes a competing patch and delete without partial history or stale deletion', async () => {
+      const [edited, deleted] = await Promise.all([patch(a, ticketA, { title: 'Concurrent correction' }), remove(officeStaff)])
+      if (edited.status === 200) {
+        expect(deleted.status).toBe(409)
+        expect(await db.collection('tickets').findOne({ id: ticketA.id })).toMatchObject({ version: 2, title: 'Concurrent correction' })
+        expect(await db.collection('events').countDocuments({ ticket_id: ticketA.id })).toBe(2)
+        expect(await db.collection('notifications').countDocuments({ ticket_id: ticketA.id })).toBe(1)
+        expect(await db.collection('ticket_deletions').countDocuments()).toBe(0)
+        expect(await db.collection('staff_audit').countDocuments({ action: 'ticket_deleted' })).toBe(0)
+      } else {
+        expect(edited.status).toBe(404)
+        expect(deleted.status).toBe(200)
+        for (const name of ['tickets', 'events', 'notifications']) {
+          expect(await db.collection(name).countDocuments(name === 'tickets' ? { id: ticketA.id } : { ticket_id: ticketA.id })).toBe(0)
+        }
+        expect(await db.collection('ticket_deletions').findOne({ id: ticketA.id })).toMatchObject({ version: 1, actor_id: officeStaff.id })
+        expect(await db.collection('staff_audit').countDocuments({ action: 'ticket_deleted' })).toBe(1)
+      }
+    })
+
+    it('rolls back ticket, dependent rows, marker and image transitions when the final audit write fails', async () => {
+      await seedImage()
+      await seedImage(ticketA, 'pending')
+      const names = [...affected, 'companies', 'customers', 'connections', 'outages']
+      const before = await snapshot(names)
+      const prototype = Object.getPrototypeOf(db.collection('staff_audit'))
+      const original = prototype.insertOne
+      let failed = false
+      const spy = vi.spyOn(prototype, 'insertOne').mockImplementation(async function (document, options) {
+        if (this.collectionName === 'staff_audit' && document.action === 'ticket_deleted') {
+          failed = true
+          throw new Error('Simulated deletion audit failure')
+        }
+        return original.call(this, document, options)
+      })
+      try { await remove(a).expect(503) } finally { spy.mockRestore() }
+      expect(failed).toBe(true)
+      expect(await snapshot(names)).toEqual(before)
+      noMediaCalls()
+    })
+
+    it('denies revoked/password-gated office access, including an otherwise exact deletion retry', async () => {
+      const pending = await staff(a, 'deletion-pending@example.test', 'office', false)
+      await remove(pending).expect(403)
+      await remove(officeStaff).expect(200)
+      const before = await snapshot(affected)
+      await mutate('post', '/api/staff', a, { action: 'reset_password', id: officeStaff.id, password }).expect(200)
+      await remove(officeStaff).expect(401)
+      const reset = await login(officeStaff.email)
+      await remove(reset).expect(403)
+      await mutate('post', '/api/staff', reset, { action: 'change_password', password: newPassword }).expect(200)
+      await remove(reset).expect(200)
+      await mutate('post', '/api/staff', a, { action: 'update', id: officeStaff.id, role: 'technician' }).expect(200)
+      await remove(reset).expect(401)
+      const demoted = await login(officeStaff.email, newPassword)
+      await remove(demoted).expect(403)
+      // Administrative audit entries are expected; deletion data must not change.
+      expect(await snapshot(affected.filter(name => name !== 'staff_audit'))).toEqual(before.filter(([name]) => name !== 'staff_audit'))
+      expect(await db.collection('staff_audit').countDocuments({ action: 'ticket_deleted' })).toBe(1)
+      noMediaCalls()
+    })
+
+    it.each(['role', 'password', 'revocation', 'logout'])('rechecks %s after authentication before deleting', async mode => {
+      await seedImage()
+      const before = await snapshot(affected)
+      const change = () => mode === 'logout'
+        ? db.collection('sessions').deleteOne({ _id: digest(officeStaff.cookie.split('=')[1]) })
+        : db.collection('users').updateOne({ id: officeStaff.id }, mode === 'revocation'
+          ? { $inc: { auth_version: 1 } }
+          : { $set: mode === 'role' ? { role: 'technician' } : { must_change_password: true } })
+      await afterAuthentication(officeStaff, change, () => remove(officeStaff).expect(['role', 'password'].includes(mode) ? 403 : 401))
+      expect(await snapshot(affected)).toEqual(before)
+      noMediaCalls()
+    })
+
+    it('keeps a committed deletion successful when remote cleanup fails and sweeps the durable queue later', async () => {
+      const image = await seedImage()
+      const ready = await seedImage(otherTicket)
+      const pending = await seedImage(ticketA, 'pending')
+      media.destroy.mockRejectedValueOnce(new Error('Simulated remote deletion outage'))
+      expect((await remove(a).expect(200)).body).toEqual({ ok: true })
+      expect(await db.collection('tickets').findOne({ id: ticketA.id })).toBeNull()
+      expect(await db.collection('events').countDocuments({ ticket_id: ticketA.id })).toBe(0)
+      expect(await db.collection('notifications').countDocuments({ ticket_id: ticketA.id })).toBe(0)
+      expect(await db.collection('ticket_deletions').findOne({ id: ticketA.id })).toMatchObject({ actor_id: a.id, version: 1 })
+      expect(await db.collection('images').findOne({ id: image.id })).toMatchObject({ state: 'deleting' })
+      expect(blobs.has(image.public_id)).toBe(true)
+      media.destroy.mockRejectedValueOnce(new Error('Simulated maintenance retry failure'))
+      await expect(cleanupImages(db, media)).rejects.toThrow('Simulated maintenance retry failure')
+      expect(await db.collection('images').findOne({ id: image.id })).toMatchObject({ state: 'deleting' })
+      await cleanupImages(db, media)
+      expect(media.destroy.mock.calls.map(([id]) => id)).toEqual(Array(3).fill(image.public_id))
+      expect(await db.collection('images').findOne({ id: image.id })).toBeNull()
+      expect(blobs.has(image.public_id)).toBe(false)
+      for (const retained of [ready, pending]) {
+        expect(await db.collection('images').findOne({ id: retained.id })).toMatchObject(retained)
+        expect(blobs.has(retained.public_id)).toBe(true)
+      }
+      await remove(a).expect(200)
+      await cleanupImages(db, media)
+      expect(media.destroy).toHaveBeenCalledTimes(3)
+      expect(await db.collection('staff_audit').countDocuments({ target_id: ticketA.id, action: 'ticket_deleted' })).toBe(1)
+    })
+
+    it('preserves pending images at the exact one-hour cutoff and cleans only older reservations', async () => {
+      const fixed = Date.now()
+      const cutoff = fixed - 60 * 60000
+      const older = await seedImage(ticketA, 'pending', new Date(cutoff - 1).toISOString())
+      const boundary = await seedImage(ticketA, 'pending', new Date(cutoff).toISOString())
+      const recent = await seedImage(ticketA, 'pending', new Date(cutoff + 1).toISOString())
+      const foreign = await seedImage(ticketB, 'pending', new Date(cutoff - 1).toISOString())
+      const clock = vi.spyOn(Date, 'now').mockReturnValue(fixed)
+      try {
+        await remove(a).expect(200)
+        expect(media.destroy).toHaveBeenCalledExactlyOnceWith(older.public_id)
+        expect(await db.collection('images').findOne({ id: older.id })).toBeNull()
+        for (const image of [boundary, recent, foreign]) {
+          expect(await db.collection('images').findOne({ id: image.id })).toMatchObject({ state: 'pending' })
+          expect(blobs.has(image.public_id)).toBe(true)
+        }
+        clock.mockReturnValue(fixed + 1)
+        await cleanupImages(db, media, { company_id: a.company_id, ticket_id: ticketA.id })
+        expect(media.destroy.mock.calls.map(([id]) => id)).toEqual([older.public_id, boundary.public_id])
+        expect(await db.collection('images').findOne({ id: boundary.id })).toBeNull()
+        expect(await db.collection('images').findOne({ id: recent.id })).toMatchObject({ state: 'pending' })
+        expect(await db.collection('images').findOne({ id: foreign.id })).toMatchObject({ state: 'pending' })
+      } finally { clock.mockRestore() }
+    })
+
+    it('does not destroy an in-flight reservation before a late upload persists, then sweeps the orphan after one hour', async () => {
+      const ready = await seedImage()
+      let started, release
+      const entered = new Promise(resolve => { started = resolve })
+      const released = new Promise(resolve => { release = resolve })
+      media.upload.mockImplementationOnce(async (buffer, publicId) => {
+        started(publicId)
+        await released
+        // Crucially persist AFTER deletion/cleanup, not before: early destruction
+        // would otherwise remove the reservation and leak this late remote blob.
+        blobs.set(publicId, Buffer.from(buffer))
+      })
+      const uploading = upload(tech, ticketA).then(response => response)
+      let publicId, reservation
+      try {
+        publicId = await Promise.race([entered, uploading.then(response => { throw new Error(`Upload ended before media barrier: ${response.status}`) })])
+        reservation = await db.collection('images').findOne({ public_id: publicId })
+        expect(reservation).toMatchObject({ ticket_id: ticketA.id, company_id: a.company_id, uploaded_by: tech.id, state: 'pending' })
+        expect(blobs.has(publicId)).toBe(false)
+        await remove(officeStaff).expect(200)
+        await cleanupImages(db, media)
+        expect(media.destroy).toHaveBeenCalledExactlyOnceWith(ready.public_id)
+        expect(await db.collection('images').findOne({ id: reservation.id })).toEqual(reservation)
+        expect(await db.collection('tickets').findOne({ id: ticketA.id })).toBeNull()
+      } finally {
+        release()
+        await uploading // Drain the request even if an assertion fails; no cross-test race.
+      }
+      expect((await uploading).status).toBe(404)
+      expect(media.upload).toHaveBeenCalledTimes(1)
+      expect(blobs.has(publicId)).toBe(true)
+      expect(await db.collection('images').findOne({ id: reservation.id })).toMatchObject({ state: 'pending' })
+      expect(await db.collection('images').countDocuments({ ticket_id: ticketA.id, state: 'ready' })).toBe(0)
+      expect(await db.collection('events').countDocuments({ ticket_id: ticketA.id })).toBe(0)
+      expect(await db.collection('notifications').countDocuments({ ticket_id: ticketA.id })).toBe(0)
+      await get(`/api/tickets/${ticketA.id}/images/${reservation.id}/content`, a).expect(404)
+      await upload(a, ticketA).expect(404)
+      await remove(officeStaff).expect(200)
+      expect(media.upload).toHaveBeenCalledTimes(1)
+      expect(media.destroy).toHaveBeenCalledTimes(1)
+      await db.collection('images').updateOne({ id: reservation.id }, { $set: { created_at: new Date(Date.now() - 60 * 60000 - 1000).toISOString() } })
+      await cleanupImages(db, media)
+      expect(media.destroy.mock.calls.map(([id]) => id)).toEqual([ready.public_id, publicId])
+      expect(blobs.has(publicId)).toBe(false)
+      expect(await db.collection('images').countDocuments({ ticket_id: ticketA.id })).toBe(0)
+      expect(await db.collection('ticket_deletions').findOne({ id: ticketA.id })).toMatchObject({ actor_id: officeStaff.id })
+      await cleanupImages(db, media)
+      expect(media.destroy).toHaveBeenCalledTimes(2)
+    }, 30000)
+  })
+
+  describe('assignment notifications', () => {
+    it('notifies every new recipient once, skips unchanged sets, and rolls back on rejected edits', async () => {
+      const input = ticketInput(connectionA, { assigned_to: [tech.id, otherTech.id, tech.id] })
+      await mutate('post', '/api/tickets', a, input).expect(201)
+      await mutate('post', '/api/tickets', a, input).expect(201)
+      const filter = { ticket_id: input.id }
+      const notices = await db.collection('notifications').find(filter).toArray()
+      expect(notices).toHaveLength(2)
+      expect(notices.map(n => n.recipient_id).sort()).toEqual([tech.id, otherTech.id].sort())
+      expect(notices.every(n => n.kind === 'created' && n.read_at === null && !n.title && !n.description)).toBe(true)
+      const item = await db.collection('tickets').findOne({ id: input.id })
+      await patch(a, item, { assigned_to: [otherTech.id, tech.id] }).expect(200)
+      await patch(tech, item, {}, 'Status note', 2).expect(200)
+      await patch(a, item, { assigned_to: [otherTech.id] }, '', 3).expect(200)
+      expect(await db.collection('notifications').countDocuments(filter)).toBe(2)
+      await patch(a, item, { assigned_to: [tech.id, otherTech.id] }, '', 4).expect(200)
+      expect(await db.collection('notifications').countDocuments({ ...filter, kind: 'assigned', recipient_id: tech.id })).toBe(1)
+      await patch(a, item, { assigned_to: [a.id] }, '', 5).expect(400)
+      await patch(a, item, { assigned_to: [] }, '', 1).expect(409)
+      expect(await db.collection('notifications').countDocuments(filter)).toBe(3)
+      const unassigned = await ticket(a, connectionA)
+      expect(await db.collection('notifications').countDocuments({ ticket_id: unassigned.id })).toBe(0)
+      await patch(a, unassigned, { assigned_to: tech.id }).expect(200)
+      expect(await db.collection('notifications').countDocuments({ ticket_id: unassigned.id, kind: 'assigned' })).toBe(1)
+    })
+    it('keeps inbox/read state private and persistent, including after assignment removal', async () => {
+      const feed = (await get('/api/notifications', tech).expect(200)).body
+      expect(feed.unread_count).toBe(1)
+      expect(feed.items[0]).toMatchObject({ recipient_id: tech.id, ticket_id: ticketA.id })
+      for (const actor of [a, b, officeStaff]) expect((await get('/api/notifications', actor).expect(200)).body).toEqual({ items: [], unread_count: 0 })
+      const id = feed.items[0].id
+      for (const actor of [a, b, otherTech]) await mutate('post', '/api/notifications/read', actor, { id }).expect(404)
+      await mutate('post', '/api/notifications/read', tech, { id }).expect(200)
+      const read = (await get('/api/notifications', tech).expect(200)).body
+      expect(read.unread_count).toBe(0); expect(read.items[0].read_at).toBeTruthy()
+      await mutate('post', '/api/notifications/read', tech, { id }).expect(200)
+      expect((await get('/api/notifications', tech).expect(200)).body).toEqual(read)
+      await patch(a, ticketA, { assigned_to: otherTech.id }).expect(200)
+      await get(`/api/tickets/${ticketA.id}/events`, tech).expect(404)
+      expect((await get('/api/notifications', tech).expect(200)).body.items).toHaveLength(1)
+      expect((await get('/api/notifications', otherTech).expect(200)).body.unread_count).toBe(2)
+      await mutate('post', '/api/notifications/read', otherTech, {}).expect(200)
+      expect((await get('/api/notifications', otherTech).expect(200)).body.unread_count).toBe(0)
+      await get('/api/notifications').expect(401)
+      await mutate('post', '/api/notifications/read', tech, { recipient_id: otherTech.id }).expect(400)
+      const signedInAgain = await login('technician@example.test', newPassword)
+      expect((await get('/api/notifications', signedInAgain).expect(200)).body.items[0].read_at).toBe(read.items[0].read_at)
+    })
+    it('caps the inbox at 100 while counting and marking all unread notifications', async () => {
+      const created_at = new Date().toISOString()
+      await db.collection('notifications').insertMany(Array.from({ length: 105 }, () => ({ id: randomUUID(), company_id: tech.company_id, recipient_id: tech.id, ticket_id: ticketA.id, ticket_number: ticketA.number, kind: 'assigned', created_at, read_at: null })))
+      const result = (await get('/api/notifications', tech).expect(200)).body
+      expect(result.items).toHaveLength(100); expect(result.unread_count).toBe(106)
+      await mutate('post', '/api/notifications/read', tech, {}).expect(200)
+      expect((await get('/api/notifications', tech).expect(200)).body.unread_count).toBe(0)
+    })
+  })
 
   describe('multiple technician assignments', () => {
     const stored = item => db.collection('tickets').findOne({ id: item.id })

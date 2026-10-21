@@ -1,5 +1,5 @@
 import { apiRequest } from './http'
-import type { DataApi, Dataset, Profile, TicketEvent, TicketImage, PerformanceReport } from './types'
+import type { DataApi, Dataset, Profile, TicketEvent, TicketImage, PerformanceReport, AttendanceReport, NotificationFeed } from './types'
 
 export class CompanyWorkspaceError extends Error {
   constructor() { super('Company workspace unavailable. Ask your administrator to verify your company membership and server setup.'); this.name = 'CompanyWorkspaceError' }
@@ -19,6 +19,10 @@ async function mutate(path: string, body: unknown, method = 'POST'): Promise<voi
   if (!result || result.ok !== true) throw new Error('The change could not be confirmed. Refresh before retrying.')
 }
 export const liveApi: DataApi = {
+  attendance: ({ from, to }, signal) => apiRequest<AttendanceReport>(`/api/attendance?${new URLSearchParams({ from, to })}`, { signal }),
+  saveAttendance: input => mutate('/api/attendance', input),
+  notifications: signal => apiRequest<NotificationFeed>('/api/notifications', { signal }),
+  readNotifications: id => mutate('/api/notifications/read', id ? { id } : {}),
   performance: ({ from, to }, signal) => apiRequest<PerformanceReport>(`/api/reports/performance?${new URLSearchParams({ from, to })}`, { signal }),
   load: signal => apiRequest<Dataset>('/api/workspace', { signal }),
   async profile(id, signal) {
@@ -43,6 +47,7 @@ export const liveApi: DataApi = {
   async updateTicket(id, version, patch, note) {
     await mutate(ticketPath(id), { version, patch, note }, 'PATCH')
   },
+  deleteTicket: (id, version, confirmation, reason) => mutate(ticketPath(id), { version, confirmation, reason }, 'DELETE'),
   async createOutage(input) {
     const { provider_id, area, title } = input
     await mutate('/api/outages', { provider_id, area, title })

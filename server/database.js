@@ -10,7 +10,7 @@ export const providers = [{ id: 'niss', name: 'NISS' }, { id: 'jio', name: 'Jio'
 
 export async function initializeDatabase(db) {
   // Dedicated dsa_service_desk database: never touch other applications' collections.
-  for (const name of ['companies', 'users', 'customers', 'connections', 'tickets', 'events', 'outages', 'images', 'staff_audit']) {
+  for (const name of ['companies', 'users', 'customers', 'connections', 'tickets', 'events', 'outages', 'images', 'staff_audit', 'attendance', 'attendance_audit', 'notifications', 'ticket_deletions']) {
     await db.collection(name).createIndex({ id: 1 }, { unique: true })
     if (name !== 'companies') await db.collection(name).createIndex({ company_id: 1 })
   }
@@ -21,6 +21,14 @@ export async function initializeDatabase(db) {
   await db.collection('events').createIndex({ company_id: 1, ticket_id: 1, created_at: 1 })
   await db.collection('events').createIndex({ company_id: 1, created_at: 1 })
   await db.collection('images').createIndex({ company_id: 1, ticket_id: 1 })
+  await db.collection('attendance').createIndex({ company_id: 1, employee_id: 1, day: 1 }, { unique: true })
+  // Daily status records may legitimately omit both times on consecutive days.
+  try { await db.collection('attendance').dropIndex('company_id_1_employee_id_1') } catch (error) { if (error.code !== 27) throw error }
+  await db.collection('attendance').createIndex({ company_id: 1, day: -1 })
+  await db.collection('attendance_audit').createIndex({ company_id: 1, attendance_id: 1, created_at: 1 })
+  await db.collection('notifications').createIndex({ company_id: 1, ticket_id: 1 })
+  await db.collection('notifications').createIndex({ company_id: 1, recipient_id: 1, created_at: -1, id: -1 })
+  await db.collection('notifications').createIndex({ company_id: 1, recipient_id: 1, read_at: 1 })
   await db.collection('sessions').createIndex({ expires_at: 1 }, { expireAfterSeconds: 0 })
   await db.collection('rate_limits').createIndex({ expires_at: 1 }, { expireAfterSeconds: 0 })
 }

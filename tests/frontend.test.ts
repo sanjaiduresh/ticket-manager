@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { existsSync, readFileSync } from 'node:fs'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
@@ -13,12 +13,275 @@ import { deskQueryOptions, discardOtherWorkspaces, profileKey, workspaceScope } 
 
 import { apiRequest } from '../src/lib/http'
 import { liveApi, imageFileError } from '../src/lib/data'
+import { whatsappLink, whatsappMessage, whatsappNumberError, whatsappTicketUrl } from '../src/lib/whatsapp'
 import { hasSavedSession, saveSessionHint, sessionHintKey } from '../src/lib/session'
 import { computeDemoPerformance, emptyReportFilters, filterReportTickets, istDate, operationalSeries, performanceExportRows, rangeError, recentRange, ticketExportRows } from '../src/lib/reporting'
-import type { Ticket, TicketEvent } from '../src/lib/types'
-afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals() })
+import type { AttendanceInput, AttendanceReport, Ticket, TicketEvent, TicketInput } from '../src/lib/types'
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
 const customer = { full_name: 'Fictional Example', phone: '0000000000', address: 'Example address', area: 'Example area', provider_id: 'niss' as const, account_number: 'DEMO-NEW', network_node: '' }
+describe('manual WhatsApp sharing', () => {
+  it('validates optional international contacts and constructs only encoded wa.me links', () => {
+    for (const phone of ['', '+12025550123', ' +919876543210 ', '+1234567', '+123456789012345']) expect(whatsappNumberError(phone)).toBe('')
+    for (const phone of ['919876543210', '+01234567', '+123', '+1234567890123456', '+1 202 555 0123', '+1202&text=secret', 'javascript:alert(1)']) {
+      expect(whatsappNumberError(phone)).not.toBe('')
+      expect(whatsappLink(phone, 'Test')).toBeNull()
+    }
+    expect(whatsappLink('', 'Test')).toBeNull()
+    const message = 'Hello & next?\nनमस्ते #ticket'
+    const url = new URL(whatsappLink('+12025550123', message)!)
+    expect(url.origin).toBe('https://wa.me'); expect(url.pathname).toBe('/12025550123')
+    expect(url.searchParams.get('text')).toBe(message)
+    expect([...url.searchParams.keys()]).toEqual(['text'])
+  })
+  it('shares minimal ticket context and a clean sign-in link, never customer text or credentials', async () => {
+    const ticket = (await createDemoApi().load()).tickets[0]
+    const message = whatsappMessage(ticket, 'https://desk.example.test/old?token=secret#fragment')
+    expect(message).toContain('DSA-1042'); expect(message).toContain('Priority: High')
+    expect(message).toContain('https://desk.example.test/tickets?ticket=demo-t-0')
+    expect(message).not.toContain(ticket.title); expect(message).not.toContain(ticket.description)
+    expect(message).not.toContain('secret'); expect(message).not.toContain('fragment')
+    for (const origin of ['http://127.0.0.1:4173', 'https://localhost', 'https://app.localhost', 'https://[::1]', 'javascript:alert(1)', 'https://user:secret@desk.example.test', 'invalid']) expect(whatsappTicketUrl(origin, ticket.id)).toBeNull()
+    expect(whatsappMessage(ticket, 'http://127.0.0.1:4173')).not.toContain('127.0.0.1')
+  })
+  it('supports demo owner contact changes/removal without publishing contacts to public profiles', async () => {
+    const api = createDemoApi()
+    await api.staff({ action: 'set_whatsapp', id: 'demo-tech-1', whatsapp_number: '+12025550123' })
+    expect((await api.load()).profiles.find(p => p.id === 'demo-tech-1')?.whatsapp_number).toBe('+12025550123')
+    expect(await api.profile('demo-tech-1')).not.toHaveProperty('whatsapp_number')
+    await expect(api.staff({ action: 'set_whatsapp', id: 'demo-tech-1', whatsapp_number: 'bad' })).rejects.toThrow('country code')
+    await api.staff({ action: 'set_whatsapp', id: 'demo-tech-1', whatsapp_number: '' })
+    expect((await api.load()).profiles.find(p => p.id === 'demo-tech-1')?.whatsapp_number).toBe('')
+    for (const id of ['demo-tech-1', 'demo-office']) await expect(createDemoApi(id).staff({ action: 'set_whatsapp', id: 'demo-tech-2', whatsapp_number: '+12025550123' })).rejects.toThrow('Owner access')
+  })
+})
+describe('attendance and notification data sources', () => {
+  const range = { from: '2026-10-01', to: '2026-10-20' }
+  const entry = (patch: Partial<AttendanceInput> = {}): AttendanceInput => ({ id: crypto.randomUUID(), employee_id: 'demo-tech-1', day: '2026-10-19', status: 'present', check_in: null, check_out: null, note: '', version: 0, ...patch })
+  beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-20T12:00:00Z')) })
+
+  it.each(['demo-owner', 'demo-office'])('allows %s to record all four statuses for employees, with optional times and attribution', async actor => {
+    const fetch = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('Network forbidden'))
+    const api = createDemoApi(actor)
+    expect((await api.attendance(range)).records).toEqual([])
+    const statuses = ['present', 'absent', 'half_day', 'leave'] as const
+    for (const [index, status] of statuses.entries()) {
+      const input = entry({ status, day: `2026-10-${16 + index}`, note: `  ${status} recorded by office  ` })
+      await api.saveAttendance(input)
+      expect(input.note).toBe(`  ${status} recorded by office  `)
+      expect((await api.attendance(range)).records.find(record => record.id === input.id)).toEqual({ ...input, note: input.note.trim(), company_id: 'demo-company', version: 1, recorded_by: actor, updated_by: actor, updated_at: '2026-10-20T12:00:00.000Z' })
+    }
+    const timed = entry({ day: '2026-10-20', employee_id: 'demo-office', check_in: '2026-10-20T09:00:00+05:30', check_out: '2026-10-20T13:30:00+05:30' })
+    await api.saveAttendance(timed)
+    expect((await api.attendance(range)).records[0]).toMatchObject({ id: timed.id, check_in: '2026-10-20T03:30:00.000Z', check_out: '2026-10-20T08:00:00.000Z' })
+    expect(fetch).not.toHaveBeenCalled()
+  })
+  it('edits the same daily record, preserves its recorder, and makes exact retries and no-op saves idempotent', async () => {
+    const api = createDemoApi('demo-office'), input = entry({ note: 'Original entry' })
+    await api.saveAttendance(input)
+    const created = (await api.attendance(range)).records[0]
+    vi.setSystemTime(new Date('2026-10-20T13:00:00Z'))
+    await api.saveAttendance(input)
+    await api.saveAttendance({ ...input, version: 1 })
+    expect((await api.attendance(range)).records).toEqual([created])
+    const correction = { ...input, version: 1, status: 'half_day' as const, check_in: '2026-10-19T03:30:00Z', check_out: '2026-10-19T07:30:00Z', note: '  Corrected after review  ' }
+    await api.saveAttendance(correction)
+    const updated = (await api.attendance(range)).records[0]
+    expect(updated).toEqual({ ...created, status: 'half_day', check_in: '2026-10-19T03:30:00.000Z', check_out: '2026-10-19T07:30:00.000Z', note: 'Corrected after review', version: 2, recorded_by: created.recorded_by, updated_by: 'demo-office', updated_at: '2026-10-20T13:00:00.000Z' })
+    vi.setSystemTime(new Date('2026-10-20T14:00:00Z'))
+    await api.saveAttendance(correction)
+    await api.saveAttendance({ ...correction, version: 2 })
+    expect((await api.attendance(range)).records).toEqual([updated])
+    await expect(api.saveAttendance(input)).rejects.toThrow('Attendance changed')
+    await api.saveAttendance({ ...input, status: 'leave', version: 2 })
+    expect((await api.attendance(range)).records).toEqual([expect.objectContaining({ id: input.id, version: 3, status: 'leave', check_in: null, check_out: null })])
+  })
+  it('rejects concurrent creates/edits, stale versions and identity changes without partial writes', async () => {
+    const api = createDemoApi(), input = entry()
+    const creates = await Promise.allSettled([api.saveAttendance(input), api.saveAttendance({ ...input, id: crypto.randomUUID() })])
+    expect(creates.map(result => result.status)).toEqual(['fulfilled', 'rejected'])
+    expect(creates[1]).toMatchObject({ reason: new Error('Attendance already exists for this employee and day. Edit the existing record') })
+    const edits = await Promise.allSettled([api.saveAttendance({ ...input, version: 1, note: 'Winning correction' }), api.saveAttendance({ ...input, version: 1, note: 'Stale correction' })])
+    expect(edits.map(result => result.status)).toEqual(['fulfilled', 'rejected'])
+    expect(edits[1]).toMatchObject({ reason: new Error('Attendance changed. Reload the record before saving') })
+    const before = await api.attendance(range)
+    for (const [patch, message] of [
+      [{ version: 0 }, 'Attendance changed'], [{ version: 99 }, 'Attendance changed'],
+      [{ version: 2, employee_id: 'demo-tech-2' }, 'Employee and attendance day cannot be changed'],
+      [{ version: 2, day: '2026-10-18' }, 'Employee and attendance day cannot be changed'],
+      [{ id: crypto.randomUUID(), version: 1 }, 'Attendance record unavailable'],
+    ] as const) {
+      await expect(api.saveAttendance({ ...input, ...patch })).rejects.toThrow(message)
+      expect(await api.attendance(range)).toEqual(before)
+    }
+    expect(before.records).toEqual([expect.objectContaining({ id: input.id, note: 'Winning correction', version: 2 })])
+  })
+  it.each([
+    [{ day: '2026-02-30' }, /valid|date/i], [{ day: '2026-10-21' }, /future day/],
+    [{ employee_id: 'foreign-employee' }, /Employee unavailable/],
+    [{ status: 'invalid' }, /Invalid attendance status or version/],
+    [{ version: -1 }, /Invalid attendance status or version/], [{ version: 0.5 }, /Invalid attendance status or version/],
+    [{ note: 'x'.repeat(2001) }, /Notes must be text/], [{ note: null }, /Notes must be text/],
+    [{ check_in: 'not-a-time' }, /Invalid attendance time/], [{ check_out: 'not-a-time' }, /Invalid attendance time/],
+    [{ check_in: '2026-10-20T13:00:00Z' }, /future/],
+    [{ check_in: '2026-10-18T18:29:59Z' }, /attendance day in IST/],
+    [{ check_out: '2026-10-19T08:00:00Z' }, /requires a check-in/],
+    [{ check_in: '2026-10-19T04:00:00Z', check_out: '2026-10-19T03:00:00Z' }, /cannot be earlier/],
+    [{ check_in: '2026-10-19T04:00:00Z', check_out: '2026-10-20T13:00:00Z' }, /future/],
+    [{ status: 'absent', check_in: '2026-10-19T04:00:00Z' }, /cannot have attendance times/],
+    [{ status: 'leave', check_out: '2026-10-19T08:00:00Z' }, /cannot have attendance times/],
+  ])('rejects invalid daily input %j atomically on create and edit', async (patch, message) => {
+    const api = createDemoApi(), input = entry()
+    await expect(api.saveAttendance({ ...input, ...patch } as AttendanceInput)).rejects.toThrow(message)
+    expect((await api.attendance(range)).records).toEqual([])
+    await api.saveAttendance(input)
+    const before = await api.attendance(range)
+    await expect(api.saveAttendance({ ...input, version: 1, ...patch } as AttendanceInput)).rejects.toThrow(message)
+    expect(await api.attendance(range)).toEqual(before)
+  })
+  it('accepts IST midnight, overnight and check-in-only times, inactive employees and maximum notes', async () => {
+    const api = createDemoApi()
+    await api.staff({ action: 'update', id: 'demo-tech-1', active: false })
+    await api.saveAttendance(entry({ check_in: '2026-10-18T18:30:00Z', check_out: '2026-10-19T19:30:00Z', note: 'x'.repeat(2000) }))
+    await api.saveAttendance(entry({ day: '2026-10-20', status: 'half_day', check_in: '2026-10-19T18:30:00Z' }))
+    expect((await api.attendance(range)).records).toEqual([
+      expect.objectContaining({ day: '2026-10-20', status: 'half_day', check_out: null }),
+      expect.objectContaining({ day: '2026-10-19', check_in: '2026-10-18T18:30:00.000Z', check_out: '2026-10-19T19:30:00.000Z', note: 'x'.repeat(2000) }),
+    ])
+  })
+  it('returns inclusive, descending, detached daily reports and resets each demo without synthesizing absences', async () => {
+    const api = createDemoApi()
+    for (const day of ['2026-10-18', '2026-10-20', '2026-10-19']) await api.saveAttendance(entry({ day }))
+    const report = await api.attendance({ from: '2026-10-19', to: '2026-10-20' })
+    expect(Object.keys(report).sort()).toEqual(['from', 'generated_at', 'records', 'to'])
+    expect(report.records.map(record => record.day)).toEqual(['2026-10-20', '2026-10-19'])
+    report.records[0].note = 'Mutated copy'
+    expect((await api.attendance(range)).records[0].note).toBe('')
+    expect((await api.attendance({ from: '2026-10-01', to: '2026-10-17' })).records).toEqual([])
+    expect((await createDemoApi().attendance(range)).records).toEqual([])
+    for (const invalid of [{ from: '', to: '' }, { from: '2026-02-30', to: '2026-03-01' }, { from: '2026-10-20', to: '2026-10-19' }, { from: '2025-01-01', to: '2026-10-20' }]) await expect(api.attendance(invalid)).rejects.toThrow()
+  })
+  it.each(['demo-tech-1', 'demo-tech-2'])('keeps %s read-only and rejects creates and edits even for their own day', async actor => {
+    const api = createDemoApi(actor)
+    expect((await api.attendance(range)).records).toEqual([])
+    for (const employee_id of [actor, 'demo-office', 'foreign']) {
+      for (const version of [0, 1]) await expect(api.saveAttendance(entry({ employee_id, version }))).rejects.toThrow('Office or owner access required')
+    }
+    expect((await api.attendance(range)).records).toEqual([])
+    for (const adapter of [api, liveApi]) {
+      expect(adapter).not.toHaveProperty('checkIn')
+      expect(adapter).not.toHaveProperty('checkOut')
+    }
+  })
+  it('returns only the demo recipient’s notifications and tracks reads', async () => {
+    const api = createDemoApi('demo-tech-1')
+    const feed = await api.notifications()
+    expect(feed.items.length).toBeGreaterThan(0)
+    expect(feed.items.every(item => item.recipient_id === 'demo-tech-1')).toBe(true)
+    await api.readNotifications(feed.items[0].id)
+    expect((await api.notifications()).unread_count).toBe(feed.unread_count - 1)
+    await expect(api.readNotifications('foreign')).rejects.toThrow('unavailable')
+    await api.readNotifications()
+    expect((await api.notifications()).unread_count).toBe(0)
+    expect((await createDemoApi().notifications()).items).toEqual([])
+  })
+  it('uses scoped same-origin endpoints and forwards cancellation for reads', async () => {
+    const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } }))
+    // Each call needs an unconsumed response body.
+    fetch.mockImplementation(async () => new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetch)
+    const signal = new AbortController().signal
+    await liveApi.attendance({ from: '2026-10-01', to: '2026-10-19' }, signal)
+    expect(fetch).toHaveBeenLastCalledWith('/api/attendance?from=2026-10-01&to=2026-10-19', expect.objectContaining({ signal, credentials: 'same-origin' }))
+    const input = entry({ status: 'half_day', check_in: '2026-10-19T04:00:00Z', note: 'Office entry' })
+    await liveApi.saveAttendance(input)
+    expect(fetch).toHaveBeenLastCalledWith('/api/attendance', expect.objectContaining({ method: 'POST', credentials: 'same-origin', body: JSON.stringify(input) }))
+    await liveApi.saveAttendance({ ...input, version: 3, status: 'leave', check_in: null })
+    expect(fetch).toHaveBeenLastCalledWith('/api/attendance', expect.objectContaining({ method: 'POST', body: JSON.stringify({ ...input, version: 3, status: 'leave', check_in: null }) }))
+    await liveApi.notifications(signal)
+    expect(fetch).toHaveBeenLastCalledWith('/api/notifications', expect.objectContaining({ signal }))
+    await liveApi.readNotifications('notice')
+    expect(fetch).toHaveBeenLastCalledWith('/api/notifications/read', expect.objectContaining({ body: JSON.stringify({ id: 'notice' }) }))
+  })
+  it('returns the daily attendance report unchanged and propagates cancellation', async () => {
+    const report: AttendanceReport = { ...range, generated_at: new Date().toISOString(), records: [{ ...entry(), company_id: 'company', version: 2, recorded_by: 'owner', updated_by: 'office', updated_at: new Date().toISOString() }] }
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(JSON.stringify(report)))
+    expect(await liveApi.attendance(range)).toEqual(report)
+    const controller = new AbortController(), abort = new DOMException('Cancelled', 'AbortError')
+    controller.abort(); fetch.mockRejectedValueOnce(abort)
+    await expect(liveApi.attendance(range, controller.signal)).rejects.toBe(abort)
+    expect(fetch).toHaveBeenLastCalledWith('/api/attendance?from=2026-10-01&to=2026-10-20', expect.objectContaining({ signal: controller.signal }))
+  })
+  it.each([[403, 'Office or owner access required'], [409, 'Attendance changed. Reload the record before saving'], [400, 'Check-in must fall on the attendance day in IST']])('preserves a %s attendance save error without retrying', async (status, message) => {
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ error: message }), { status }))
+    await expect(liveApi.saveAttendance(entry())).rejects.toMatchObject({ name: 'ApiError', status, message })
+    expect(fetch).toHaveBeenCalledTimes(1)
+  })
+  it.each([{ ok: false }, {}, null])('rejects an unconfirmed attendance save response %j', async response => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(response)))
+    await expect(liveApi.saveAttendance(entry())).rejects.toThrow('could not be confirmed')
+  })
+})
+describe('demo ticket deletion adapter', () => {
+  const input = (): TicketInput => ({ id: crypto.randomUUID(), connection_id: null, title: 'Delete this demo complaint', description: '', category: 'Other', priority: 'normal', assigned_to: ['demo-tech-1'], due_at: null, outage_id: null })
+  it.each(['demo-owner', 'demo-office'])('lets %s delete locally, retry only the same request, and never recreate a deleted UUID or reuse its number', async actor => {
+    const fetch = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('Network forbidden'))
+    const api = createDemoApi(actor), original = await api.load()
+    const highest = original.tickets.reduce((a, b) => a.number > b.number ? a : b)
+    await api.deleteTicket(highest.id, highest.version, `DSA-${highest.number}`, 'Remove highest seeded number')
+    const first = input()
+    await api.createTicket(first)
+    const created = (await api.load()).tickets.find(ticket => ticket.id === first.id)!
+    expect(created.number).toBe(highest.number + 1)
+    await api.updateTicket(first.id, 1, {}, 'Note to be removed')
+    expect(await api.events(first.id)).toHaveLength(3)
+    const confirmation = `DSA-${created.number}`
+    await api.deleteTicket(first.id, 2, confirmation, '  Duplicate complaint  ')
+    const deleted = await api.load()
+    expect(deleted.tickets.some(ticket => ticket.id === first.id || ticket.id === highest.id)).toBe(false)
+    expect(deleted.customers).toEqual(original.customers)
+    expect(deleted.connections).toEqual(original.connections)
+    await api.deleteTicket(first.id, 2, confirmation, 'Duplicate complaint')
+    for (const [version, ref, reason] of [[1, confirmation, 'Duplicate complaint'], [2, 'DSA-0', 'Duplicate complaint'], [2, confirmation, 'Different reason']] as const) {
+      await expect(api.deleteTicket(first.id, version, ref, reason)).rejects.toThrow('deletion request does not match')
+    }
+    await expect(api.createTicket(first)).rejects.toThrow('permanently deleted')
+    await expect(api.updateTicket(first.id, 2, {}, 'Cannot restore')).rejects.toThrow('Ticket unavailable')
+    await expect(api.events(first.id)).rejects.toThrow('Ticket unavailable')
+    expect(await api.load()).toEqual(deleted)
+    const second = input()
+    await api.createTicket(second); await api.createTicket(second)
+    expect((await api.load()).tickets.filter(ticket => ticket.id === second.id)).toEqual([expect.objectContaining({ number: created.number + 1, version: 1 })])
+    expect((await createDemoApi(actor).load()).tickets).toHaveLength(original.tickets.length)
+    expect(fetch).not.toHaveBeenCalled()
+  })
+  it('rejects stale versions, wrong references, invalid reasons and missing tickets without changing data or events', async () => {
+    const api = createDemoApi(), before = await api.load(), ticket = before.tickets[0]
+    const events = await api.events(ticket.id), confirmation = `DSA-${ticket.number}`
+    for (const [id, version, ref, reason, message] of [
+      [ticket.id, 0, confirmation, 'Duplicate', 'Ticket changed'],
+      [ticket.id, 1, `${confirmation} `, 'Duplicate', 'exact ticket reference'],
+      [ticket.id, 1, String(ticket.number), 'Duplicate', 'exact ticket reference'],
+      [ticket.id, 1, confirmation, ' \n ', 'deletion reason'],
+      [ticket.id, 1, confirmation, 'x'.repeat(501), 'deletion reason'],
+      [crypto.randomUUID(), 1, confirmation, 'Duplicate', 'Ticket unavailable'],
+    ] as const) {
+      await expect(api.deleteTicket(id, version, ref, reason)).rejects.toThrow(message)
+      expect(await api.load()).toEqual(before)
+      expect(await api.events(ticket.id)).toEqual(events)
+    }
+    await api.deleteTicket(ticket.id, 1, confirmation, 'x'.repeat(500))
+    expect((await api.load()).tickets).toHaveLength(before.tickets.length - 1)
+  })
+  it.each(['demo-tech-1', 'demo-tech-2'])('denies %s deletion of assigned tickets without changing their inbox or history', async actor => {
+    const api = createDemoApi(actor), before = await api.load(), ticket = before.tickets[0]
+    const feed = await api.notifications(), events = await api.events(ticket.id)
+    await expect(api.deleteTicket(ticket.id, ticket.version, `DSA-${ticket.number}`, 'Duplicate')).rejects.toThrow('Office or owner access required')
+    expect(await api.load()).toEqual(before)
+    expect(await api.events(ticket.id)).toEqual(events)
+    expect(await api.notifications()).toEqual(feed)
+  })
+})
 describe('multiple technician assignment', () => {
   const input = { id: 'multi', connection_id: null, title: 'Shared complaint', description: '', category: 'Other', priority: 'normal' as const, assigned_to: ['demo-tech-1', 'demo-tech-2', 'demo-tech-1'], due_at: null, outage_id: null }
   it('normalizes legacy strings/null and arrays without mutating, truncating or double-counting', () => {

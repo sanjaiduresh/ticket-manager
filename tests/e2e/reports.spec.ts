@@ -28,6 +28,7 @@ async function fixture(page: Page, role: Role = 'owner', empty = false) {
     if (url.pathname === '/api/auth/session') return reply({ user: { id: actor.id, email: 'fake@example.test' } })
     if (url.pathname === '/api/profile') return reply(actor)
     if (url.pathname === '/api/workspace') return reply(data)
+    if (url.pathname === '/api/notifications') return reply({ items: [], unread_count: 0 })
     if (url.pathname === '/api/reports/performance') {
       requests.push(url)
       return failure ? reply({ error: 'Performance access denied' }, failure) : reply({ from: url.searchParams.get('from'), to: url.searchParams.get('to'), generated_at: '2026-10-16T10:00:00Z', employees: empty ? [] : employees })
